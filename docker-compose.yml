@@ -1,0 +1,39 @@
+# Orquestación: bot + API + dashboard compartiendo la BD de configuración.
+x-common: &common
+  build: .
+  env_file: .env
+  environment:
+    SETTINGS_DB_PATH: /data/settings.db
+  volumes:
+    - botdata:/data
+  restart: unless-stopped
+
+services:
+  bot:
+    <<: *common
+    command: python main.py
+    ports:
+      - "9100:9100"   # exporter Prometheus
+
+  api:
+    <<: *common
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+
+  dashboard:
+    <<: *common
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
+    environment:
+      API_URL: http://api:8000
+      SETTINGS_DB_PATH: /data/settings.db
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+
+volumes:
+  botdata:

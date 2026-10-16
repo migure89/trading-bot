@@ -1,0 +1,21 @@
+# Broker y datos
+alpaca-py>=0.44,<1
+# Datos y cálculo
+pandas>=2.2
+numpy>=1.26
+# Autoaprendizaje
+optuna>=4.0
+# API y dashboard
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+streamlit>=1.40
+plotly>=5.24
+requests>=2.32
+# Monitorización y utilidades
+prometheus-client>=0.21
+python-dotenv>=1.0
+# Desarrollo / tests
+pytest>=8.0
+httpx>=0.27
+ruff>=0.6
