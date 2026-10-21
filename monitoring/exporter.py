@@ -5,11 +5,12 @@ import os
 
 from prometheus_client import Counter, Gauge, start_http_server
 
-EQUITY = Gauge("bot_equity_usd", "Equity de la cuenta Alpaca")
+EQUITY = Gauge("bot_equity_usd", "Equity de la cuenta del broker activo")
 DAILY_PNL = Gauge("bot_daily_pnl_usd", "PnL diario")
 OPEN_POSITIONS = Gauge("bot_open_positions", "Número de posiciones abiertas")
 BOT_ENABLED = Gauge("bot_enabled", "1 si el bot está activo")
 LIVE_MODE = Gauge("bot_live_mode", "1 si opera en real")
+BROKER_CONNECTED = Gauge("bot_broker_connected", "1 si el broker responde", ["broker"])
 ORDERS = Counter("bot_orders_total", "Órdenes enviadas", ["symbol", "side"])
 ERRORS = Counter("bot_errors_total", "Errores en el bucle principal")
 ITERATIONS = Counter("bot_iterations_total", "Iteraciones del bucle principal")

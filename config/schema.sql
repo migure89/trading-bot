@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS trades (
     qty         REAL NOT NULL,
     price       REAL,
     mode        TEXT NOT NULL,
+    broker      TEXT,                   -- alpaca | ibkr
     order_id    TEXT,
     pnl         REAL,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))

@@ -1,4 +1,4 @@
-"""Backend FastAPI de control y telemetría del bot."""
+"""Backend FastAPI de control y telemetría del bot (Alpaca / Interactive Brokers)."""
 from __future__ import annotations
 
 from typing import Any
@@ -7,14 +7,15 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from config.settings import LiveTradingNotConfirmed, SettingsStore
-from execution.broker import AlpacaBroker
+from config.settings import LiveTradingNotConfirmed, SettingsStore, resolve_data_provider
+from execution.base import BaseBroker, BrokerConnectionError
+from execution.factory import BrokerRegistry
 
 load_dotenv()
-app = FastAPI(title="Trading Bot API", version="1.0.0")
+app = FastAPI(title="Trading Bot API", version="1.1.0")
 
 _store: SettingsStore | None = None
-_broker: AlpacaBroker | None = None
+_brokers: BrokerRegistry | None = None
 
 
 def get_store() -> SettingsStore:
@@ -24,21 +25,38 @@ def get_store() -> SettingsStore:
     return _store
 
 
-def get_broker() -> AlpacaBroker:
-    global _broker
-    if _broker is None:
-        _broker = AlpacaBroker()
-    return _broker
+def get_brokers() -> BrokerRegistry:
+    global _brokers
+    if _brokers is None:
+        _brokers = BrokerRegistry()
+    return _brokers
+
+
+def active_broker(store: SettingsStore, brokers: BrokerRegistry) -> BaseBroker:
+    """Broker activo según la configuración, ya preparado para el modo actual."""
+    cfg = store.load()
+    broker = brokers.get(cfg["broker"])
+    try:
+        broker.ensure_mode(cfg["mode"])
+    except LiveTradingNotConfirmed as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except BrokerConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return broker
 
 
 class ConfigUpdate(BaseModel):
     mode: str | None = Field(None, pattern="^(paper|live)$")
+    broker: str | None = Field(None, pattern="^(alpaca|ibkr)$")
+    data_provider: str | None = Field(None, pattern="^(auto|alpaca|ibkr)$")
     symbols: list[str] | None = None
     risk_pct: float | None = Field(None, gt=0, le=10)
     timeframe: str | None = None
     loop_interval_sec: int | None = Field(None, ge=5)
     lookback_days: int | None = Field(None, ge=1)
     strategy_params: dict[str, Any] | None = None
+    # Confirmación explícita para cambiar de broker estando (o pasando) a live.
+    confirm_live: bool = False
 
 
 class ToggleRequest(BaseModel):
@@ -56,18 +74,31 @@ def health():
 
 
 @app.get("/status")
-def status(store: SettingsStore = Depends(get_store), broker: AlpacaBroker = Depends(get_broker)):
+def status(store: SettingsStore = Depends(get_store), brokers: BrokerRegistry = Depends(get_brokers)):
     cfg = store.load()
     out: dict[str, Any] = {"mode": cfg["mode"], "bot_enabled": cfg["bot_enabled"],
+                           "broker": cfg["broker"], "data_provider": resolve_data_provider(cfg),
                            "symbols": cfg["symbols"], "account": None, "positions": []}
+    broker = brokers.get(cfg["broker"])
     try:
         broker.ensure_mode(cfg["mode"])
         out["account"] = broker.account()
         out["positions"] = broker.positions()
         out["unrealized_pl"] = sum(p["unrealized_pl"] for p in out["positions"])
-    except Exception as exc:  # sin credenciales o Alpaca caído: la API sigue respondiendo
+    except Exception as exc:  # sin credenciales o broker caído: la API sigue respondiendo
         out["error"] = str(exc)
+    try:
+        out["connection"] = broker.connection_status()
+    except Exception as exc:
+        out["connection"] = {"broker": cfg["broker"], "connected": False, "last_error": str(exc)}
     return out
+
+
+@app.get("/brokers")
+def list_brokers(store: SettingsStore = Depends(get_store), brokers: BrokerRegistry = Depends(get_brokers)):
+    cfg = store.load()
+    return {"active": cfg["broker"], "data_provider": resolve_data_provider(cfg),
+            "mode": cfg["mode"], "available": brokers.available(), "connections": brokers.statuses()}
 
 
 @app.get("/config")
@@ -78,6 +109,15 @@ def read_config(store: SettingsStore = Depends(get_store)):
 @app.post("/config")
 def update_config(body: ConfigUpdate, store: SettingsStore = Depends(get_store)):
     changes = body.model_dump(exclude_none=True)
+    confirm_live = changes.pop("confirm_live", False)
+    current = store.load()
+    target_mode = changes.get("mode", current["mode"])
+    if ("broker" in changes and changes["broker"] != current["broker"]
+            and target_mode == "live" and not confirm_live):
+        raise HTTPException(
+            status_code=409,
+            detail="Cambiar de broker en modo LIVE requiere confirm_live=true (operarás con dinero real)",
+        )
     try:
         return store.update(changes)
     except LiveTradingNotConfirmed as exc:
@@ -88,22 +128,27 @@ def update_config(body: ConfigUpdate, store: SettingsStore = Depends(get_store))
 
 @app.post("/toggle-bot")
 def toggle_bot(body: ToggleRequest, store: SettingsStore = Depends(get_store),
-               broker: AlpacaBroker = Depends(get_broker)):
+               brokers: BrokerRegistry = Depends(get_brokers)):
     enabled = (not store.get("bot_enabled")) if body.enabled is None else body.enabled
-    store.update({"bot_enabled": enabled})
+    store.update({"bot_enabled": enabled})  # se pausa antes de tocar el broker
     closed = False
     if body.close_positions:
-        broker.ensure_mode(store.get("mode"))
-        broker.close_all()
+        active_broker(store, brokers).close_all()
         closed = True
     return {"bot_enabled": enabled, "positions_closed": closed}
 
 
+@app.post("/cancel-orders")
+def cancel_orders(store: SettingsStore = Depends(get_store), brokers: BrokerRegistry = Depends(get_brokers)):
+    broker = active_broker(store, brokers)
+    broker.cancel_all_orders()
+    return {"cancelled": True, "broker": broker.name}
+
+
 @app.post("/close-position")
 def close_position(body: ClosePositionRequest, store: SettingsStore = Depends(get_store),
-                   broker: AlpacaBroker = Depends(get_broker)):
-    broker.ensure_mode(store.get("mode"))
-    broker.close_position(body.symbol)
+                   brokers: BrokerRegistry = Depends(get_brokers)):
+    active_broker(store, brokers).close_position(body.symbol)
     return {"closed": body.symbol}
 
 

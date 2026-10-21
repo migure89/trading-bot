@@ -20,6 +20,8 @@ DEFAULT_DB_PATH = Path(os.getenv("SETTINGS_DB_PATH", BASE_DIR / "settings.db"))
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "mode": "paper",              # paper | live
+    "broker": "alpaca",           # alpaca | ibkr  (broker activo, conmutable en caliente)
+    "data_provider": "auto",      # auto (= broker activo) | alpaca | ibkr
     "bot_enabled": False,         # kill switch: False = pausado
     "symbols": ["AAPL", "MSFT"],  # activos (acciones o cripto tipo "BTC/USD")
     "risk_pct": 1.0,              # % del equity arriesgado por operación
@@ -40,6 +42,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 VALID_MODES = {"paper", "live"}
+VALID_BROKERS = {"alpaca", "ibkr"}
+VALID_DATA_PROVIDERS = {"auto", *VALID_BROKERS}
 
 
 class LiveTradingNotConfirmed(PermissionError):
@@ -48,6 +52,12 @@ class LiveTradingNotConfirmed(PermissionError):
 
 def live_trading_confirmed() -> bool:
     return os.getenv("CONFIRM_LIVE_TRADING", "false").strip().lower() == "true"
+
+
+def resolve_data_provider(cfg: dict[str, Any]) -> str:
+    """Nombre del proveedor de datos efectivo ("auto" = el del broker activo)."""
+    provider = cfg.get("data_provider", "auto")
+    return cfg.get("broker", "alpaca") if provider == "auto" else provider
 
 
 class SettingsStore:
@@ -73,6 +83,10 @@ class SettingsStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock, self._conn() as conn:
             conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+            # Migración: BDs creadas antes del soporte multi-broker no tienen trades.broker
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(trades)")}
+            if "broker" not in cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN broker TEXT")
             for key, value in DEFAULT_SETTINGS.items():
                 conn.execute(
                     "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
@@ -103,6 +117,21 @@ class SettingsStore:
                     "Para operar en real exporta CONFIRM_LIVE_TRADING=true"
                 )
             changes["mode"] = mode
+        if "broker" in changes:
+            broker = str(changes["broker"]).lower()
+            if broker not in VALID_BROKERS:
+                raise ValueError(f"Broker inválido: {broker}")
+            target_mode = changes.get("mode") or self.get("mode")
+            if target_mode == "live" and not live_trading_confirmed():
+                raise LiveTradingNotConfirmed(
+                    "Cambiar de broker en live exige CONFIRM_LIVE_TRADING=true"
+                )
+            changes["broker"] = broker
+        if "data_provider" in changes:
+            provider = str(changes["data_provider"]).lower()
+            if provider not in VALID_DATA_PROVIDERS:
+                raise ValueError(f"Proveedor de datos inválido: {provider}")
+            changes["data_provider"] = provider
         if "risk_pct" in changes:
             risk = float(changes["risk_pct"])
             if not 0 < risk <= 10:
@@ -142,12 +171,13 @@ class SettingsStore:
         ]
 
     def record_trade(self, symbol: str, side: str, qty: float, price: float | None,
-                     mode: str, order_id: str | None = None, pnl: float | None = None) -> None:
+                     mode: str, order_id: str | None = None, pnl: float | None = None,
+                     broker: str | None = None) -> None:
         with self._lock, self._conn() as conn:
             conn.execute(
-                "INSERT INTO trades(symbol, side, qty, price, mode, order_id, pnl) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (symbol, side, qty, price, mode, order_id, pnl),
+                "INSERT INTO trades(symbol, side, qty, price, mode, broker, order_id, pnl) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (symbol, side, qty, price, mode, broker, order_id, pnl),
             )
 
     def trades(self, limit: int = 500) -> list[dict]:
