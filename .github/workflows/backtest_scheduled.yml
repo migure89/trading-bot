@@ -9,9 +9,17 @@ on:
         description: "Número de trials de Optuna"
         default: "100"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: backtest-scheduled
+  cancel-in-progress: false
+
 jobs:
   optimize:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
       APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
@@ -22,6 +30,12 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - name: Comprobar credenciales de Alpaca
+        run: |
+          if [ -z "$APCA_API_KEY_ID" ] || [ -z "$APCA_API_SECRET_KEY" ]; then
+            echo "::error::Faltan los secrets APCA_API_KEY_ID / APCA_API_SECRET_KEY en el repositorio"
+            exit 1
+          fi
       - run: pip install -r requirements.txt
       - run: mkdir -p artifacts
       - name: Ejecutar optimización (no aplica en producción, solo informa)
@@ -30,3 +44,4 @@ jobs:
         with:
           name: optimization-results
           path: artifacts/
+          retention-days: 30
