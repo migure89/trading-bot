@@ -6,6 +6,10 @@ from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 
+from data.base import OHLCV_COLUMNS, empty_bars, is_crypto
+
+__all__ = ["AlpacaDataProvider", "is_crypto", "normalize_bars"]
+
 TIMEFRAME_MAP = {
     "1Min": (1, "Minute"),
     "5Min": (5, "Minute"),
@@ -13,11 +17,6 @@ TIMEFRAME_MAP = {
     "1Hour": (1, "Hour"),
     "1Day": (1, "Day"),
 }
-
-
-def is_crypto(symbol: str) -> bool:
-    """Los pares cripto de Alpaca usan formato 'BTC/USD'."""
-    return "/" in symbol
 
 
 def _timeframe(tf: str):
@@ -29,6 +28,8 @@ def _timeframe(tf: str):
 
 class AlpacaDataProvider:
     """Envuelve StockHistoricalDataClient y CryptoHistoricalDataClient."""
+
+    name = "alpaca"
 
     def __init__(self, api_key: str | None = None, secret_key: str | None = None,
                  stock_client=None, crypto_client=None) -> None:
@@ -76,8 +77,8 @@ class AlpacaDataProvider:
 def normalize_bars(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     """Quita el MultiIndex (symbol, timestamp) que devuelve alpaca-py."""
     if df is None or df.empty:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        return empty_bars()
     if isinstance(df.index, pd.MultiIndex):
         df = df.xs(symbol, level="symbol") if symbol in df.index.get_level_values(0) else df.droplevel(0)
-    df = df[["open", "high", "low", "close", "volume"]].astype(float).sort_index()
+    df = df[OHLCV_COLUMNS].astype(float).sort_index()
     return df

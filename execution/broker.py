@@ -1,20 +1,24 @@
 """Cliente de órdenes sobre TradingClient de alpaca-py con modo paper/live dinámico."""
 from __future__ import annotations
 
-import math
 import os
 
 from config.settings import LiveTradingNotConfirmed, live_trading_confirmed
-from data.alpaca_data import is_crypto
+from data.base import is_crypto
+from execution.base import BaseBroker
 
 
-class AlpacaBroker:
+class AlpacaBroker(BaseBroker):
     """Recrea el TradingClient cuando cambia el modo en la configuración."""
+
+    name = "alpaca"
 
     def __init__(self, client_factory=None) -> None:
         self._factory = client_factory or self._default_factory
         self._client = None
         self.mode: str | None = None
+        self._last_ok = False
+        self.last_error: str | None = None
 
     @staticmethod
     def _default_factory(paper: bool):
@@ -39,8 +43,23 @@ class AlpacaBroker:
         return self._client
 
     # ---- consultas ------------------------------------------------------
+    def connection_status(self) -> dict:
+        """Alpaca es REST: 'connected' indica que la última llamada a la cuenta funcionó."""
+        return {
+            "broker": self.name,
+            "connected": self._client is not None and self._last_ok,
+            "mode": self.mode,
+            "credentials": bool(os.getenv("APCA_API_KEY_ID") and os.getenv("APCA_API_SECRET_KEY")),
+            "last_error": self.last_error,
+        }
+
     def account(self) -> dict:
-        a = self.client.get_account()
+        try:
+            a = self.client.get_account()
+        except Exception as exc:
+            self._last_ok, self.last_error = False, str(exc)
+            raise
+        self._last_ok, self.last_error = True, None
         equity, last = float(a.equity), float(a.last_equity)
         return {
             "equity": equity,
@@ -63,24 +82,7 @@ class AlpacaBroker:
             for p in self.client.get_all_positions()
         ]
 
-    def position_qty(self, symbol: str) -> float:
-        key = symbol.replace("/", "")
-        for p in self.positions():
-            if p["symbol"] in (symbol, key):
-                return p["qty"]
-        return 0.0
-
     # ---- órdenes --------------------------------------------------------
-    @staticmethod
-    def position_size(equity: float, risk_pct: float, price: float, atr_value: float,
-                      atr_mult: float, crypto: bool = False) -> float:
-        """Tamaño por riesgo: (equity*riesgo%) / (ATR*mult), limitado al equity."""
-        if price <= 0 or atr_value <= 0:
-            return 0.0
-        risk_cash = equity * risk_pct / 100
-        qty = min(risk_cash / (atr_value * atr_mult), equity / price)
-        return round(qty, 6) if crypto else float(math.floor(qty))
-
     def market_order(self, symbol: str, qty: float, side: str):
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
@@ -95,6 +97,9 @@ class AlpacaBroker:
 
     def close_position(self, symbol: str):
         return self.client.close_position(symbol.replace("/", ""))
+
+    def cancel_all_orders(self):
+        return self.client.cancel_orders()
 
     def close_all(self):
         """Kill switch: cancela órdenes y liquida todas las posiciones."""

@@ -1,4 +1,4 @@
-"""Dashboard Streamlit: control Paper/Live, kill switch, métricas y parámetros IA.
+"""Dashboard Streamlit: broker (Alpaca/IBKR), control Paper/Live, kill switch, métricas y parámetros IA.
 
 Se comunica exclusivamente con la API FastAPI (API_URL), totalmente desacoplado.
 Ejecutar: streamlit run dashboard/app.py
@@ -53,6 +53,50 @@ with st.sidebar:
             api("POST", "/config", json={"mode": "paper"})
             st.rerun()
 
+    # ---- broker activo y estado de conexión ----
+    st.divider()
+    brokers_info = api("GET", "/brokers") or {}
+    labels = {"alpaca": "Alpaca", "ibkr": "Interactive Brokers"}
+    current_broker = cfg.get("broker", "alpaca")
+    conn = status.get("connection") or {}
+    dot = "🟢 conectado" if conn.get("connected") else "🔴 desconectado"
+    st.markdown(f"**Broker:** {labels.get(current_broker, current_broker)} · {dot}")
+    if current_broker == "ibkr":
+        st.caption(f"{conn.get('host', '?')}:{conn.get('port') or conn.get('port_paper', '?')} · "
+                   f"client id {conn.get('client_id', '?')} · cuenta {conn.get('account') or '—'}")
+    if conn.get("last_error"):
+        st.caption(f"⚠️ {conn['last_error']}")
+    options = brokers_info.get("available") or list(labels)
+    new_broker = st.selectbox("Broker activo", options, index=options.index(current_broker)
+                              if current_broker in options else 0, format_func=lambda b: labels.get(b, b))
+    if new_broker != current_broker:
+        st.info("Las posiciones abiertas en el broker anterior dejarán de gestionarse por el bot.")
+        payload = {"broker": new_broker}
+        ok = True
+        if mode == "live":
+            st.warning("Estás en LIVE: el nuevo broker operará con DINERO REAL.")
+            typed = st.text_input("Escribe CONFIRMAR para cambiar de broker", key="confirm_broker")
+            ok = typed == "CONFIRMAR"
+            payload["confirm_live"] = True
+        if st.button(f"Cambiar a {labels.get(new_broker, new_broker)}", disabled=not ok):
+            if api("POST", "/config", json=payload):
+                st.rerun()
+    dp_opts = ["auto", "alpaca", "ibkr"]
+    current_dp = cfg.get("data_provider", "auto")
+    new_dp = st.selectbox("Datos de mercado", dp_opts, index=dp_opts.index(current_dp),
+                          format_func=lambda d: "Auto (mismo que el broker)" if d == "auto" else labels[d])
+    if new_dp != current_dp and st.button("Guardar proveedor de datos"):
+        api("POST", "/config", json={"data_provider": new_dp})
+        st.rerun()
+    with st.expander("Conexiones"):
+        for name, info in (brokers_info.get("connections") or {}).items():
+            if info.get("connected"):
+                state = "🟢"
+            else:
+                state = "🔴" if info.get("initialized") else "⚪ sin usar"
+            st.write(f"{labels.get(name, name)}: {state}")
+
+    st.divider()
     enabled = cfg.get("bot_enabled", False)
     st.markdown(f"**Bot:** {'▶️ activo' if enabled else '⏸️ pausado'}")
     if st.button("⏸️ Pausar bot" if enabled else "▶️ Arrancar bot"):
@@ -62,10 +106,13 @@ with st.sidebar:
     if st.button("🛑 KILL SWITCH: pausar y cerrar todo", type="primary"):
         api("POST", "/toggle-bot", json={"enabled": False, "close_positions": True})
         st.rerun()
+    if st.button("✖️ Cancelar órdenes abiertas"):
+        if api("POST", "/cancel-orders"):
+            st.success("Órdenes canceladas")
 
 st.title("📈 Plataforma de Trading Cuantitativo")
 if status.get("error"):
-    st.info(f"Alpaca no disponible: {status['error']}")
+    st.info(f"{labels.get(status.get('broker'), 'Broker')} no disponible: {status['error']}")
 
 # ---------------- métricas ------------------------------------------------
 acc = status.get("account") or {}

@@ -1,5 +1,6 @@
-# Broker y datos
+# Brokers y datos
 alpaca-py>=0.44,<1
+ib_async>=2.0,<3          # Interactive Brokers (TWS / IB Gateway), sucesor de ib_insync
 # Datos y cálculo
 pandas>=2.2
 numpy>=1.26

@@ -1,23 +1,39 @@
 # Orquestación: bot + API + dashboard compartiendo la BD de configuración.
+# IB Gateway es opcional:  docker compose --profile ibkr up -d
+x-env: &env
+  SETTINGS_DB_PATH: /data/settings.db
+  # Dentro de la red de Docker, gnzsnz/ib-gateway publica la API en 4004 (paper) y 4003 (live).
+  # Para usar TWS/Gateway instalado en tu ordenador: IBKR_DOCKER_HOST=host.docker.internal
+  # e IBKR_DOCKER_PORT_PAPER=7497 / IBKR_DOCKER_PORT_LIVE=7496 (TWS) o 4002 / 4001 (Gateway).
+  IBKR_HOST: ${IBKR_DOCKER_HOST:-ib-gateway}
+  IBKR_PORT_PAPER: ${IBKR_DOCKER_PORT_PAPER:-4004}
+  IBKR_PORT_LIVE: ${IBKR_DOCKER_PORT_LIVE:-4003}
+
 x-common: &common
   build: .
   env_file: .env
-  environment:
-    SETTINGS_DB_PATH: /data/settings.db
   volumes:
     - botdata:/data
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   restart: unless-stopped
 
 services:
   bot:
     <<: *common
     command: python main.py
+    environment:
+      <<: *env
+      IBKR_CLIENT_ID: "1"          # cada proceso necesita un client id distinto
     ports:
       - "9100:9100"   # exporter Prometheus
 
   api:
     <<: *common
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    environment:
+      <<: *env
+      IBKR_CLIENT_ID: "2"
     ports:
       - "8000:8000"
     healthcheck:
@@ -28,12 +44,36 @@ services:
     <<: *common
     command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
     environment:
+      <<: *env
       API_URL: http://api:8000
-      SETTINGS_DB_PATH: /data/settings.db
     ports:
       - "8501:8501"
     depends_on:
       - api
+
+  # Optimización manual con datos de IBKR:
+  #   docker compose run --rm -e IBKR_CLIENT_ID=3 bot python -m optimization.optimizer --provider ibkr
+
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    profiles: ["ibkr"]
+    restart: unless-stopped
+    environment:
+      TWS_USERID: ${TWS_USERID:-}
+      TWS_PASSWORD: ${TWS_PASSWORD:-}
+      TRADING_MODE: ${TRADING_MODE:-paper}          # paper | live | both
+      READ_ONLY_API: ${READ_ONLY_API:-no}
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}  # vacío = sin VNC
+      TWOFA_TIMEOUT_ACTION: ${TWOFA_TIMEOUT_ACTION:-restart}
+      RELOGIN_AFTER_TWOFA_TIMEOUT: ${RELOGIN_AFTER_TWOFA_TIMEOUT:-yes}
+      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-11:59 PM}
+      TIME_ZONE: ${TIME_ZONE:-Europe/Madrid}
+      TZ: ${TIME_ZONE:-Europe/Madrid}
+    ports:
+      # Solo en localhost del host: 4001 = live, 4002 = paper, 5900 = VNC
+      - "127.0.0.1:4001:4003"
+      - "127.0.0.1:4002:4004"
+      - "127.0.0.1:5900:5900"
 
 volumes:
   botdata:

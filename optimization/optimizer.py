@@ -100,14 +100,20 @@ def run_feedback_loop(store: SettingsStore, provider, n_trials: int = 50,
 def main() -> None:
     from dotenv import load_dotenv
 
-    from data.alpaca_data import AlpacaDataProvider
+    from config.settings import resolve_data_provider
+    from data.factory import DataProviderRegistry
 
     load_dotenv()
     ap = argparse.ArgumentParser(description="Reoptimiza la estrategia con Optuna")
     ap.add_argument("--trials", type=int, default=50)
     ap.add_argument("--no-apply", action="store_true", help="solo informa, no guarda en la BD")
+    ap.add_argument("--provider", choices=["alpaca", "ibkr"], default=None,
+                    help="proveedor de datos (por defecto el de la configuración)")
     args = ap.parse_args()
-    res = run_feedback_loop(SettingsStore(), AlpacaDataProvider(), args.trials, not args.no_apply)
+    store = SettingsStore()
+    name = args.provider or resolve_data_provider(store.load())
+    log.info("proveedor de datos", extra={"provider": name})
+    res = run_feedback_loop(store, DataProviderRegistry().get(name), args.trials, not args.no_apply)
     print(json.dumps([{k: v for k, v in r.items()} for r in res], indent=2, default=str))
 
 
