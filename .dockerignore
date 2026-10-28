@@ -1,10 +1,11 @@
 # Nada de secretos, entornos ni datos locales dentro de la imagen.
 # Las variables se inyectan en tiempo de ejecución con env_file (.env) en docker-compose.
-.env
-.env.*
+# Ojo: en .dockerignore "*.db" solo afecta a la raíz; "**/" lo aplica en cualquier carpeta.
+**/.env
+**/.env.*
 !.env.example
-*.pem
-*.key
+**/*.pem
+**/*.key
 
 # Entornos virtuales y control de versiones
 .venv/
@@ -13,15 +14,15 @@ venv/
 .github/
 
 # Datos y logs locales
-*.db
-*.db-journal
-*.sqlite
-*.log
+**/*.db
+**/*.db-journal
+**/*.sqlite
+**/*.log
 artifacts/
 
 # Cachés y ficheros del editor/SO
-__pycache__/
-*.py[cod]
+**/__pycache__/
+**/*.py[cod]
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -29,4 +30,4 @@ __pycache__/
 htmlcov/
 .idea/
 .vscode/
-.DS_Store
+**/.DS_Store

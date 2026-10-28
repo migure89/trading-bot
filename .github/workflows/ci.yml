@@ -41,14 +41,14 @@ jobs:
         run: |
           echo "APCA_API_SECRET_KEY=no-debe-estar-en-la-imagen" > .env
           echo "x" > .env.local
-          mkdir -p .venv && touch .venv/marker config/settings.db
+          mkdir -p .venv && touch .venv/marker config/settings.db && echo "x" > config/.env
       - name: Build
         run: docker build -t trading-bot:ci .
       - name: Comprobar el contenido de la imagen
         run: |
           docker run --rm --entrypoint sh trading-bot:ci -c '
             set -e
-            for f in /app/.env /app/.env.local /app/.venv /app/.git /app/config/settings.db; do
+            for f in /app/.env /app/.env.local /app/.venv /app/.git /app/config/settings.db /app/config/.env; do
               if [ -e "$f" ]; then echo "ERROR: $f está dentro de la imagen"; exit 1; fi
             done
             test -f /app/.env.example && test -f /app/main.py
