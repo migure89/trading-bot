@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import sys
 
 import pandas as pd
 import plotly.express as px
@@ -21,6 +22,14 @@ if os.getenv("SKIP_DOTENV", "").lower() not in {"1", "true", "yes"}:
     for _env in (os.getenv("ENV_FILE"), ".env", os.path.join(os.path.dirname(__file__), "..", ".env")):
         if _env and os.path.isfile(_env):
             load_dotenv(_env, override=False)
+
+# Constantes compartidas con la API (rangos de validación): raíz del proyecto en sys.path.
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from config.settings import RISK_PCT_MAX  # noqa: E402
+
+RISK_STEP = 0.1  # el slider empieza en este valor (la API exige risk_pct > 0)
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 # Mismo token que la API (API_TOKEN); se envía en cada petición si está definido.
@@ -188,13 +197,28 @@ if status.get("error"):
     st.info(f"{labels.get(status.get('broker'), 'Broker')} no disponible: {status['error']}")
 
 # ---------------- métricas ------------------------------------------------
-acc = status.get("account") or {}
+NA = "—"
+
+
+def money(value) -> str:
+    return f"${value:,.2f}" if isinstance(value, (int, float)) else NA
+
+
+acc = status.get("account")          # None si el broker no responde: se muestra "—", no $0.00
 positions = status.get("positions") or []
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Capital (equity)", f"${acc.get('equity', 0):,.2f}")
-c2.metric("PnL diario", f"${acc.get('daily_pnl', 0):,.2f}", f"{acc.get('daily_pnl_pct', 0):.2f}%")
-c3.metric("Posiciones abiertas", len(positions))
-c4.metric("PnL flotante", f"${status.get('unrealized_pl', 0):,.2f}")
+if acc:
+    pct = acc.get("daily_pnl_pct")
+    c1.metric("Capital (equity)", money(acc.get("equity")))
+    c2.metric("PnL diario", money(acc.get("daily_pnl")),
+              f"{pct:.2f}%" if isinstance(pct, (int, float)) else None)
+    c3.metric("Posiciones abiertas", len(positions))
+    c4.metric("PnL flotante", money(status.get("unrealized_pl")))
+else:
+    c1.metric("Capital (equity)", NA)
+    c2.metric("PnL diario", NA)
+    c3.metric("Posiciones abiertas", NA)
+    c4.metric("PnL flotante", NA)
 
 tab_pos, tab_perf, tab_ai = st.tabs(["Posiciones", "Rendimiento", "Parámetros IA"])
 
@@ -237,8 +261,13 @@ with tab_ai:
         cols = st.columns(3)
         new = {}
         for i, (k, v) in enumerate(params.items()):
-            new[k] = cols[i % 3].number_input(k, value=float(v) if isinstance(v, float) else int(v))
-        risk = st.slider("% riesgo por operación", 0.1, 5.0, float(cfg.get("risk_pct", 1.0)), 0.1)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                new[k] = v               # valor no numérico: se conserva tal cual
+                continue
+            new[k] = cols[i % 3].number_input(k, value=v)
+        # Mismo rango que la API (RISK_PCT_MAX); el valor guardado se recorta solo para dibujarlo.
+        current_risk = min(max(float(cfg.get("risk_pct", 1.0)), RISK_STEP), RISK_PCT_MAX)
+        risk = st.slider("% riesgo por operación", RISK_STEP, RISK_PCT_MAX, current_risk, RISK_STEP)
         symbols = st.text_input("Activos (separados por coma)", ",".join(cfg.get("symbols", [])))
         if st.form_submit_button("Guardar (hot-reload)"):
             act("POST", "/config", "Configuración guardada; el bot la aplicará en la próxima iteración.",

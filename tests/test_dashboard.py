@@ -117,3 +117,42 @@ def test_dashboard_password_gate(fake_api, monkeypatch):
     assert any("incorrecta" in e.value for e in at.error) and not fake_api.calls
     at.text_input(key="dashboard_password").input("clave").run()
     assert any(c[1] == "/status" for c in fake_api.calls)
+
+
+# --- Issue #14 --------------------------------------------------------------------------------
+def test_cards_show_dash_without_account(fake_api):
+    at = run_app()
+    values = {m.label: m.value for m in at.metric}
+    assert values["Capital (equity)"] == "—" and values["PnL diario"] == "—"
+    assert values["PnL flotante"] == "—"
+    assert "$0.00" not in values.values()
+
+
+def test_cards_with_account(fake_api, monkeypatch):
+    status = {"mode": "paper", "broker": "alpaca", "bot_enabled": True, "positions": [],
+              "account": {"equity": 1234.5, "daily_pnl": -10.0, "daily_pnl_pct": -0.8},
+              "unrealized_pl": 0.0, "connection": {"connected": True}}
+    orig = fake_api.__call__
+
+    def call(method, url, timeout=None, **kw):
+        return FakeResponse(200, status) if url.endswith("/status") else orig(method, url, timeout, **kw)
+
+    monkeypatch.setattr(requests, "request", call)
+    values = {m.label: m.value for m in run_app().metric}
+    assert values["Capital (equity)"] == "$1,234.50" and values["PnL diario"] == "$-10.00"
+
+
+def test_risk_slider_uses_shared_max(fake_api, monkeypatch):
+    from config.settings import RISK_PCT_MAX
+
+    monkeypatch.setitem(CONFIG, "risk_pct", 8.0)
+    at = run_app()
+    slider = at.slider[0]
+    assert slider.max == RISK_PCT_MAX and slider.value == 8.0
+
+
+def test_non_numeric_strategy_param_is_kept(fake_api, monkeypatch):
+    monkeypatch.setitem(CONFIG, "strategy_params", {"ema_fast": 12, "label": "x", "flag": True})
+    at = run_app()
+    assert not at.exception
+    assert [n.label for n in at.number_input] == ["ema_fast"]
