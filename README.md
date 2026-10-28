@@ -68,7 +68,8 @@ docker compose up -d --build
 | API (docs Swagger) | http://localhost:8000/docs |
 | Métricas Prometheus | http://localhost:9100/metrics |
 
-Los tres servicios comparten la BD en el volumen `botdata`. Para Interactive Brokers con el
+Los tres servicios comparten la BD en el volumen `botdata`. El `.env` **no** se copia en la imagen
+(`.dockerignore`); las variables se inyectan al arrancar con `env_file`, y el CI lo comprueba en cada PR. Para Interactive Brokers con el
 contenedor de IB Gateway incluido: `docker compose --profile ibkr up -d --build` (ver sección 9). El bot arranca **pausado**:
 actívalo desde el dashboard o con `curl -X POST localhost:8000/toggle-bot -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' -d '{"enabled": true}'`.
 
