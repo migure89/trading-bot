@@ -8,6 +8,10 @@ import pandas as pd
 
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 
+
+class DataProviderError(RuntimeError):
+    """El proveedor de datos no puede servir el símbolo (sin credenciales, caído…)."""
+
 # Timeframes admitidos en la configuración (comunes a todos los proveedores).
 TIMEFRAMES = ("1Min", "5Min", "15Min", "1Hour", "1Day")
 

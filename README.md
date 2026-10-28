@@ -151,6 +151,21 @@ muestra. Todo queda en `optimization_runs`. Usa el proveedor de datos de la conf
 indiques: `python -m optimization.optimizer --provider ibkr` (con un `IBKR_CLIENT_ID` libre, p.ej. 3). El workflow `backtest_scheduled.yml` lo ejecuta en días
 laborables y publica los resultados como artefacto.
 
+- **Errores por símbolo:** si un símbolo falla (sin datos, sin claves de Alpaca para acciones, IBKR
+  caído…) se registra y se sigue con el resto; el resultado incluye `errors: [{symbol, error}]`. El
+  proceso sale con código 2 si no se pudo optimizar ningún símbolo o el proveedor no está disponible.
+- **Salida:** stdout (o `--output fichero.json`) contiene solo el JSON
+  `{"results", "errors", "skipped", "applied"}`; los logs van por stderr.
+- **Cómo se aplican los parámetros:**
+  1. *Junto al bot* (recomendado): `python -m optimization.optimizer --trials 100` sobre la BD real
+     (p.ej. un cron en la misma máquina); solo aplica si mejora fuera de muestra y el bot lo lee en caliente.
+  2. *Desde el CI:* el workflow corre con `--no-apply` sobre una BD temporal. Para optimizar la
+     configuración real, pasa su JSON en el input `config_json` o en la variable de repositorio
+     `OPTIMIZER_CONFIG_JSON` (p.ej. la salida de `GET /config`). El resumen del job muestra los
+     resultados; para aplicarlos, descarga el artefacto y ejecuta junto al bot
+     `python -m optimization.optimizer --apply-report optimization.json` (valida los parámetros
+     antes de guardarlos).
+
 ## 7. API
 
 Todas las rutas salvo `/health` exigen `API_TOKEN` si está definido (sección 2.1).

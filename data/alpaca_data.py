@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 
-from data.base import OHLCV_COLUMNS, empty_bars, is_crypto
+from data.base import OHLCV_COLUMNS, DataProviderError, empty_bars, is_crypto
 
 __all__ = ["AlpacaDataProvider", "is_crypto", "normalize_bars"]
 
@@ -43,6 +43,10 @@ class AlpacaDataProvider:
         if self._stock is None:
             from alpaca.data.historical import StockHistoricalDataClient
 
+            if not (self.api_key and self.secret_key):
+                raise DataProviderError(
+                    "Los datos de acciones de Alpaca requieren APCA_API_KEY_ID y APCA_API_SECRET_KEY "
+                    "(los de cripto son públicos)")
             self._stock = StockHistoricalDataClient(self.api_key, self.secret_key)
         return self._stock
 

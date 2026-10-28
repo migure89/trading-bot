@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 
 import optuna
@@ -73,32 +74,63 @@ def optimize(df: pd.DataFrame, base_params: dict, n_trials: int = 50,
 
 
 def run_feedback_loop(store: SettingsStore, provider, n_trials: int = 50,
-                      apply: bool = True) -> list[dict]:
-    """Reoptimiza cada símbolo configurado y aplica el mejor resultado global."""
+                      apply: bool = True) -> dict:
+    """Reoptimiza cada símbolo configurado y aplica el mejor resultado global.
+
+    Un fallo en un símbolo (datos, proveedor caído…) se registra y no detiene el resto.
+    Devuelve ``{"results": [...], "errors": [{"symbol", "error"}], "skipped": [...], "applied": ...}``.
+    """
     cfg = store.load()
-    results = []
+    results, errors, skipped = [], [], []
     for symbol in cfg["symbols"]:
-        df = provider.get_bars(symbol, cfg["timeframe"], days=max(cfg["lookback_days"] * 3, 60))
-        if len(df) < 200:
-            log.warning("datos insuficientes", extra={"symbol": symbol, "bars": len(df)})
+        try:
+            df = provider.get_bars(symbol, cfg["timeframe"], days=max(cfg["lookback_days"] * 3, 60))
+            if len(df) < 200:
+                log.warning("datos insuficientes", extra={"symbol": symbol, "bars": len(df)})
+                skipped.append({"symbol": symbol, "bars": len(df)})
+                continue
+            res = optimize(df, cfg["strategy_params"], n_trials, cfg["timeframe"])
+        except Exception as exc:  # noqa: BLE001 - se informa y se sigue con el siguiente símbolo
+            error = str(exc) or type(exc).__name__
+            log.error("optimización fallida", extra={"symbol": symbol, "error": error},
+                      exc_info=log.isEnabledFor(logging.DEBUG))
+            errors.append({"symbol": symbol, "error": error})
             continue
-        res = optimize(df, cfg["strategy_params"], n_trials, cfg["timeframe"])
         res["symbol"] = symbol
         store.save_optimization(symbol, res["best_params"], res["best_oos"], False)
         log.info("optimización completada", extra={"symbol": symbol, "improved": res["improved"],
                                                    "oos": res["best_oos"]})
         results.append(res)
 
+    applied = None
     winners = [r for r in results if r["improved"]]
     if apply and winners:
         best = max(winners, key=lambda r: objective_score(r["best_oos"]))
-        store.update({"strategy_params": best["best_params"]})
-        store.save_optimization(best["symbol"], best["best_params"], best["best_oos"], True)
-        log.info("nuevos parámetros aplicados", extra={"params": best["best_params"]})
-    return results
+        applied = apply_params(store, best["best_params"], best["symbol"], best["best_oos"])
+    return {"results": results, "errors": errors, "skipped": skipped, "applied": applied}
 
 
-def main() -> None:
+def apply_params(store: SettingsStore, params: dict, symbol: str, metrics: dict) -> dict:
+    """Guarda los parámetros ganadores (validados por el store) y los marca como aplicados."""
+    store.update({"strategy_params": params})
+    store.save_optimization(symbol, params, metrics, True)
+    log.info("nuevos parámetros aplicados", extra={"symbol": symbol, "params": params})
+    return {"symbol": symbol, "params": params}
+
+
+def apply_report(store: SettingsStore, path: str) -> dict | None:
+    """Aplica el mejor resultado *mejorado* de un JSON generado con ``--output`` (p.ej. el del CI)."""
+    with open(path, encoding="utf-8") as fh:
+        report = json.load(fh)
+    winners = [r for r in report.get("results", []) if r.get("improved")]
+    if not winners:
+        log.info("el informe no tiene parámetros que mejoren a los actuales", extra={"file": path})
+        return None
+    best = max(winners, key=lambda r: objective_score(r["best_oos"]))
+    return apply_params(store, best["best_params"], best["symbol"], best["best_oos"])
+
+
+def main() -> int:
     from config.settings import resolve_data_provider
     from data.factory import DataProviderRegistry
 
@@ -110,13 +142,41 @@ def main() -> None:
     ap.add_argument("--no-apply", action="store_true", help="solo informa, no guarda en la BD")
     ap.add_argument("--provider", choices=["alpaca", "ibkr"], default=None,
                     help="proveedor de datos (por defecto el de la configuración)")
+    ap.add_argument("--output", "-o", default=None,
+                    help="fichero donde escribir el resultado JSON (por defecto stdout)")
+    ap.add_argument("--apply-report", metavar="FICHERO", default=None,
+                    help="no optimiza: aplica el mejor resultado mejorado de un JSON de --output")
     args = ap.parse_args()
     store = SettingsStore()
+
+    if args.apply_report:
+        applied = apply_report(store, args.apply_report)
+        write_output({"applied": applied}, args.output)
+        return 0
+
     name = args.provider or resolve_data_provider(store.load())
     log.info("proveedor de datos", extra={"provider": name})
-    res = run_feedback_loop(store, DataProviderRegistry().get(name), args.trials, not args.no_apply)
-    print(json.dumps([{k: v for k, v in r.items()} for r in res], indent=2, default=str))
+    try:
+        provider = DataProviderRegistry().get(name)
+    except Exception as exc:  # noqa: BLE001
+        log.error("proveedor de datos no disponible", extra={"provider": name, "error": str(exc)})
+        return 2
+    report = run_feedback_loop(store, provider, args.trials, not args.no_apply)
+    write_output(report, args.output)
+    if report["errors"] and not report["results"]:
+        log.error("ningún símbolo se pudo optimizar", extra={"errors": report["errors"]})
+        return 2
+    return 0
+
+
+def write_output(data: dict, path: str | None) -> None:
+    text = json.dumps(data, indent=2, default=str)
+    if path:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    else:
+        print(text)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
