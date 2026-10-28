@@ -45,6 +45,23 @@ def active_broker(store: SettingsStore, brokers: BrokerRegistry) -> BaseBroker:
     return broker
 
 
+def broker_call(fn, *args, action: str = "la operación"):
+    """Ejecuta una operación del broker y traduce sus errores a respuestas HTTP claras.
+
+    - ``BrokerConnectionError`` (sin credenciales, TWS/Gateway caído): 503.
+    - Cualquier otro error del broker (orden rechazada, 401 de Alpaca…): 502 con el motivo,
+      en lugar de un 500 con traceback.
+    """
+    try:
+        return fn(*args)
+    except HTTPException:
+        raise
+    except BrokerConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"El broker rechazó {action}: {exc}") from exc
+
+
 class ConfigUpdate(BaseModel):
     mode: str | None = Field(None, pattern="^(paper|live)$")
     broker: str | None = Field(None, pattern="^(alpaca|ibkr)$")
@@ -133,7 +150,15 @@ def toggle_bot(body: ToggleRequest, store: SettingsStore = Depends(get_store),
     store.update({"bot_enabled": enabled})  # se pausa antes de tocar el broker
     closed = False
     if body.close_positions:
-        active_broker(store, brokers).close_all()
+        try:
+            broker = active_broker(store, brokers)
+            broker_call(broker.close_all, action="el cierre de posiciones")
+        except HTTPException as exc:
+            estado = "pausado" if not enabled else "activo"
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=f"El bot quedó {estado}, pero NO se pudieron cerrar las posiciones: {exc.detail}",
+            ) from exc
         closed = True
     return {"bot_enabled": enabled, "positions_closed": closed}
 
@@ -141,14 +166,15 @@ def toggle_bot(body: ToggleRequest, store: SettingsStore = Depends(get_store),
 @app.post("/cancel-orders")
 def cancel_orders(store: SettingsStore = Depends(get_store), brokers: BrokerRegistry = Depends(get_brokers)):
     broker = active_broker(store, brokers)
-    broker.cancel_all_orders()
+    broker_call(broker.cancel_all_orders, action="la cancelación de órdenes")
     return {"cancelled": True, "broker": broker.name}
 
 
 @app.post("/close-position")
 def close_position(body: ClosePositionRequest, store: SettingsStore = Depends(get_store),
                    brokers: BrokerRegistry = Depends(get_brokers)):
-    active_broker(store, brokers).close_position(body.symbol)
+    broker = active_broker(store, brokers)
+    broker_call(broker.close_position, body.symbol, action=f"el cierre de {body.symbol}")
     return {"closed": body.symbol}
 
 

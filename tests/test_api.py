@@ -88,3 +88,46 @@ def test_broker_switch_in_live_needs_confirmation(client, monkeypatch):
     assert client.post("/config", json={"broker": "ibkr"}).status_code == 409
     r = client.post("/config", json={"broker": "ibkr", "confirm_live": True})
     assert r.status_code == 200 and r.json()["broker"] == "ibkr"
+
+
+# ---- Regresiones issue #2: Alpaca sin credenciales / errores del broker ----
+@pytest.fixture
+def client_no_keys(store, monkeypatch):
+    monkeypatch.delenv("APCA_API_KEY_ID", raising=False)
+    monkeypatch.delenv("APCA_API_SECRET_KEY", raising=False)
+    registry = BrokerRegistry({"alpaca": AlpacaBroker})
+    api_main.app.dependency_overrides[api_main.get_store] = lambda: store
+    api_main.app.dependency_overrides[api_main.get_brokers] = lambda: registry
+    yield TestClient(api_main.app, raise_server_exceptions=False)
+    api_main.app.dependency_overrides.clear()
+
+
+@pytest.mark.parametrize("path,body", [
+    ("/cancel-orders", None),
+    ("/close-position", {"symbol": "AAPL"}),
+    ("/toggle-bot", {"enabled": False, "close_positions": True}),
+])
+def test_alpaca_without_keys_returns_503(client_no_keys, path, body):
+    r = client_no_keys.post(path, json=body)
+    assert r.status_code == 503
+    assert "APCA_API_KEY_ID" in r.json()["detail"]
+
+
+def test_kill_switch_error_says_bot_is_paused(client_no_keys, store):
+    store.update({"bot_enabled": True})
+    r = client_no_keys.post("/toggle-bot", json={"enabled": False, "close_positions": True})
+    assert r.status_code == 503 and "pausado" in r.json()["detail"]
+    assert store.get("bot_enabled") is False
+
+
+def test_status_reports_last_error_without_keys(client_no_keys):
+    r = client_no_keys.get("/status").json()
+    assert "APCA_API_KEY_ID" in r["error"]
+    assert r["connection"]["credentials"] is False
+    assert "APCA_API_KEY_ID" in r["connection"]["last_error"]
+
+
+def test_broker_rejection_returns_502(client, fake_trading_client):
+    fake_trading_client.cancel_orders.side_effect = RuntimeError("forbidden")
+    r = client.post("/cancel-orders")
+    assert r.status_code == 502 and "forbidden" in r.json()["detail"]

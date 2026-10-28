@@ -5,7 +5,13 @@ import os
 
 from config.settings import LiveTradingNotConfirmed, live_trading_confirmed
 from data.base import is_crypto
-from execution.base import BaseBroker
+from execution.base import BaseBroker, BrokerConnectionError
+
+
+def alpaca_credentials() -> tuple[str, str] | None:
+    """Claves de Alpaca del entorno, o ``None`` si falta alguna."""
+    key, secret = os.getenv("APCA_API_KEY_ID", "").strip(), os.getenv("APCA_API_SECRET_KEY", "").strip()
+    return (key, secret) if key and secret else None
 
 
 class AlpacaBroker(BaseBroker):
@@ -24,16 +30,26 @@ class AlpacaBroker(BaseBroker):
     def _default_factory(paper: bool):
         from alpaca.trading.client import TradingClient
 
-        return TradingClient(
-            os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY"), paper=paper
-        )
+        creds = alpaca_credentials()
+        if creds is None:
+            raise BrokerConnectionError(
+                "Alpaca no está configurado: faltan APCA_API_KEY_ID y/o APCA_API_SECRET_KEY en el entorno")
+        return TradingClient(*creds, paper=paper)
 
     def ensure_mode(self, mode: str):
         if mode == "live" and not live_trading_confirmed():
             raise LiveTradingNotConfirmed("CONFIRM_LIVE_TRADING=true es obligatorio para live")
         if self._client is None or mode != self.mode:
-            self._client = self._factory(paper=(mode != "live"))
-            self.mode = mode
+            try:
+                client = self._factory(paper=(mode != "live"))
+            except BrokerConnectionError as exc:
+                self._last_ok, self.last_error = False, str(exc)
+                raise
+            except Exception as exc:  # p.ej. ValueError de alpaca-py con claves vacías
+                self._last_ok = False
+                self.last_error = f"No se pudo crear el cliente de Alpaca: {exc}"
+                raise BrokerConnectionError(self.last_error) from exc
+            self._client, self.mode = client, mode
         return self._client
 
     @property
@@ -49,7 +65,7 @@ class AlpacaBroker(BaseBroker):
             "broker": self.name,
             "connected": self._client is not None and self._last_ok,
             "mode": self.mode,
-            "credentials": bool(os.getenv("APCA_API_KEY_ID") and os.getenv("APCA_API_SECRET_KEY")),
+            "credentials": alpaca_credentials() is not None,
             "last_error": self.last_error,
         }
 
