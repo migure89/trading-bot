@@ -50,7 +50,8 @@ def test_dotenv_applies_without_docker(tmp_path):
              if k not in {"SETTINGS_DB_PATH", "LOG_LEVEL", "SKIP_DOTENV", "ENV_FILE"}}
     clean["PYTHONPATH"] = str(ROOT)
     code = ("from config.settings import SettingsStore; from monitoring.logger import get_logger;"
-            "print(SettingsStore().db_path); print(get_logger('x').level)")
+            "get_logger('x'); import logging; print(SettingsStore().db_path); "
+            "print(logging.getLogger().level)")
     out = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, env=clean,
                          capture_output=True, text=True, check=True).stdout.split()
     assert out == [str(db), str(logging.WARNING)]

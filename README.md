@@ -181,6 +181,11 @@ Con el bot **en pausa** no se conecta al broker. Si el broker falla, el bot rein
 exponencial (`loop_interval_sec` × 2ⁿ, máximo 5 min) y solo escribe un ERROR cuando cambia el error;
 al recuperarse escribe `broker reconectado`.
 
+**Logs:** todos los procesos (bot, API/uvicorn, optimizador, ib_async, optuna) escriben **una línea
+JSON por evento** (`ts`, `level`, `logger`, `msg`, campos extra y `exc` con el traceback). `LOG_FILE`
+duplica la salida en un fichero y `LOG_LEVELS` ajusta niveles por logger. El optimizador escribe los
+logs por stderr y el resultado por stdout.
+
 Ejemplo de reglas de alerta:
 
 ```yaml

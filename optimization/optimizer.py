@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 import optuna
 import pandas as pd
 
 from backtesting.engine import run_backtest
 from config.settings import SettingsStore
-from monitoring.logger import get_logger
+from monitoring.logger import get_logger, install_excepthook, setup_logging
 
 log = get_logger("optimizer")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -101,6 +102,9 @@ def main() -> None:
     from config.settings import resolve_data_provider
     from data.factory import DataProviderRegistry
 
+    # Logs JSON por stderr; stdout queda solo para el resultado (JSON) de la optimización.
+    setup_logging(stream=sys.stderr, force=True)
+    install_excepthook("optimizer")
     ap = argparse.ArgumentParser(description="Reoptimiza la estrategia con Optuna")
     ap.add_argument("--trials", type=int, default=50)
     ap.add_argument("--no-apply", action="store_true", help="solo informa, no guarda en la BD")

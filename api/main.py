@@ -23,7 +23,10 @@ from config.settings import (
 )
 from execution.base import BaseBroker, BrokerConnectionError
 from execution.factory import BrokerRegistry
+from monitoring.logger import setup_logging
 
+# JSON también para uvicorn (access/error): se importa después de que uvicorn configure su logging.
+setup_logging(force=True)
 log = logging.getLogger("api")
 
 # Rutas públicas (sin token): healthcheck de Docker/balanceadores.

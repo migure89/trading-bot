@@ -7,6 +7,7 @@ descarga datos, calcula la señal y ejecuta órdenes dimensionadas por riesgo.
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 import time
 
@@ -17,7 +18,7 @@ from data.factory import DataProviderRegistry
 from execution.base import CANCELED, FILLED, PARTIAL, REJECTED, BaseBroker
 from execution.factory import BrokerRegistry
 from monitoring import exporter
-from monitoring.logger import get_logger
+from monitoring.logger import get_logger, install_excepthook
 from strategies.ema_rsi import latest_action
 from strategies.indicators import atr
 
@@ -171,6 +172,7 @@ class TradingBot:
 
 
 def main() -> None:
+    install_excepthook("bot")
     ap = argparse.ArgumentParser(description="Bot de trading cuantitativo (Alpaca / Interactive Brokers)")
     ap.add_argument("--once", action="store_true", help="ejecuta una sola iteración")
     ap.add_argument("--no-metrics", action="store_true", help="no arranca el exporter Prometheus")
@@ -179,7 +181,7 @@ def main() -> None:
         exporter.start_exporter()
     bot = TradingBot(SettingsStore(), DataProviderRegistry(), BrokerRegistry())
     if args.once:
-        print(bot.iteration())
+        print(json.dumps(bot.iteration(), default=str))
     else:
         bot.run()
 
