@@ -1,10 +1,15 @@
 """Backend FastAPI de control y telemetría del bot (Alpaca / Interactive Brokers)."""
 from __future__ import annotations
 
+import logging
+import os
+import secrets
+from contextlib import asynccontextmanager
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from config.settings import LiveTradingNotConfirmed, SettingsStore, resolve_data_provider
@@ -12,7 +17,64 @@ from execution.base import BaseBroker, BrokerConnectionError
 from execution.factory import BrokerRegistry
 
 load_dotenv()
-app = FastAPI(title="Trading Bot API", version="1.1.0")
+log = logging.getLogger("api")
+
+# Rutas públicas (sin token): healthcheck de Docker/balanceadores.
+PUBLIC_PATHS = frozenset({"/health"})
+
+_bearer = HTTPBearer(auto_error=False, description="Token de API_TOKEN")
+_api_key = APIKeyHeader(name="X-API-Key", auto_error=False, description="Token de API_TOKEN")
+
+
+def api_token() -> str:
+    """Token configurado en ``API_TOKEN`` (vacío = autenticación desactivada)."""
+    return os.getenv("API_TOKEN", "").strip()
+
+
+def require_token(
+    request: Request,
+    bearer: HTTPAuthorizationCredentials | None = Security(_bearer),
+    api_key: str | None = Security(_api_key),
+) -> None:
+    """Exige ``Authorization: Bearer <API_TOKEN>`` o ``X-API-Key: <API_TOKEN>`` si hay token."""
+    expected = api_token()
+    if not expected or request.url.path in PUBLIC_PATHS:
+        return
+    supplied = (bearer.credentials if bearer else None) or api_key or ""
+    if not secrets.compare_digest(supplied.encode(), expected.encode()):
+        raise HTTPException(status_code=401, detail="Token de API ausente o no válido",
+                            headers={"WWW-Authenticate": "Bearer"})
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if not api_token():
+        log.warning("API_TOKEN no está definido: la API de control NO tiene autenticación. "
+                    "Defínelo en .env y no expongas el puerto fuera de localhost.")
+    yield
+
+
+app = FastAPI(title="Trading Bot API", version="1.2.0", lifespan=lifespan,
+              dependencies=[Depends(require_token)])
+
+
+def mask_account(account: str | None) -> str | None:
+    """'DU1234567' -> 'DU****567': suficiente para distinguir cuentas sin exponer el número."""
+    if not account:
+        return account
+    if len(account) <= 5:
+        return "*" * len(account)
+    return f"{account[:2]}{'*' * (len(account) - 5)}{account[-3:]}"
+
+
+def public_connection(info: dict) -> dict:
+    """Copia del estado de conexión con los números de cuenta enmascarados."""
+    info = dict(info)
+    if "account" in info:
+        info["account"] = mask_account(info["account"])
+    if "accounts" in info:
+        info["accounts"] = [mask_account(a) for a in info["accounts"] or []]
+    return info
 
 _store: SettingsStore | None = None
 _brokers: BrokerRegistry | None = None
@@ -105,7 +167,7 @@ def status(store: SettingsStore = Depends(get_store), brokers: BrokerRegistry = 
     except Exception as exc:  # sin credenciales o broker caído: la API sigue respondiendo
         out["error"] = str(exc)
     try:
-        out["connection"] = broker.connection_status()
+        out["connection"] = public_connection(broker.connection_status())
     except Exception as exc:
         out["connection"] = {"broker": cfg["broker"], "connected": False, "last_error": str(exc)}
     return out
@@ -115,7 +177,8 @@ def status(store: SettingsStore = Depends(get_store), brokers: BrokerRegistry = 
 def list_brokers(store: SettingsStore = Depends(get_store), brokers: BrokerRegistry = Depends(get_brokers)):
     cfg = store.load()
     return {"active": cfg["broker"], "data_provider": resolve_data_provider(cfg),
-            "mode": cfg["mode"], "available": brokers.available(), "connections": brokers.statuses()}
+            "mode": cfg["mode"], "available": brokers.available(),
+            "connections": {k: public_connection(v) for k, v in brokers.statuses().items()}}
 
 
 @app.get("/config")

@@ -1,4 +1,8 @@
-"""Exporter Prometheus con métricas del bot (puerto METRICS_PORT, 9100 por defecto)."""
+"""Exporter Prometheus con métricas del bot.
+
+Escucha en ``METRICS_ADDR:METRICS_PORT`` (por defecto ``127.0.0.1:9100``). En Docker se usa
+``METRICS_ADDR=0.0.0.0`` dentro del contenedor y el puerto se publica solo en localhost del host.
+"""
 from __future__ import annotations
 
 import os
@@ -16,8 +20,9 @@ ERRORS = Counter("bot_errors_total", "Errores en el bucle principal")
 ITERATIONS = Counter("bot_iterations_total", "Iteraciones del bucle principal")
 
 
-def start_exporter(port: int | None = None) -> None:
-    start_http_server(int(port or os.getenv("METRICS_PORT", 9100)))
+def start_exporter(port: int | None = None, addr: str | None = None) -> None:
+    start_http_server(int(port or os.getenv("METRICS_PORT", 9100)),
+                      addr=addr or os.getenv("METRICS_ADDR", "127.0.0.1"))
 
 
 def update_account(account: dict, n_positions: int, enabled: bool, mode: str) -> None:

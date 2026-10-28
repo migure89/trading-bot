@@ -1,5 +1,9 @@
 # Orquestación: bot + API + dashboard compartiendo la BD de configuración.
 # IB Gateway es opcional:  docker compose --profile ibkr up -d
+#
+# Seguridad: los puertos se publican SOLO en 127.0.0.1 del host (BIND_ADDR). Si necesitas acceder
+# desde otra máquina, pon delante un proxy con TLS y autenticación (o una VPN) y define API_TOKEN
+# y DASHBOARD_PASSWORD en .env; no cambies BIND_ADDR a 0.0.0.0 sin ellos.
 x-env: &env
   SETTINGS_DB_PATH: /data/settings.db
   # Dentro de la red de Docker, gnzsnz/ib-gateway publica la API en 4004 (paper) y 4003 (live).
@@ -25,8 +29,9 @@ services:
     environment:
       <<: *env
       IBKR_CLIENT_ID: "1"          # cada proceso necesita un client id distinto
+      METRICS_ADDR: 0.0.0.0        # dentro del contenedor; en el host solo se publica en BIND_ADDR
     ports:
-      - "9100:9100"   # exporter Prometheus
+      - "${BIND_ADDR:-127.0.0.1}:9100:9100"   # exporter Prometheus
 
   api:
     <<: *common
@@ -35,8 +40,9 @@ services:
       <<: *env
       IBKR_CLIENT_ID: "2"
     ports:
-      - "8000:8000"
+      - "${BIND_ADDR:-127.0.0.1}:8000:8000"
     healthcheck:
+      # /health es la única ruta pública: no necesita API_TOKEN
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
 
@@ -47,7 +53,7 @@ services:
       <<: *env
       API_URL: http://api:8000
     ports:
-      - "8501:8501"
+      - "${BIND_ADDR:-127.0.0.1}:8501:8501"
     depends_on:
       - api
 

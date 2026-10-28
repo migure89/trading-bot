@@ -58,7 +58,7 @@ def test_switch_to_ibkr_hot(client, fake_ib):
     assert r["account"]["equity"] == 100000 and r["account"]["daily_pnl"] == 500
     assert r["connection"]["connected"] is True and r["connection"]["port"] == 4002
     info = client.get("/brokers").json()
-    assert info["active"] == "ibkr" and info["connections"]["ibkr"]["account"] == "DU1234567"
+    assert info["active"] == "ibkr" and info["connections"]["ibkr"]["account"] == "DU****567"
 
 
 def test_ibkr_kill_switch_and_cancel(client, fake_ib):
@@ -131,3 +131,42 @@ def test_broker_rejection_returns_502(client, fake_trading_client):
     fake_trading_client.cancel_orders.side_effect = RuntimeError("forbidden")
     r = client.post("/cancel-orders")
     assert r.status_code == 502 and "forbidden" in r.json()["detail"]
+
+
+# ---- Regresiones issue #12: autenticación por API_TOKEN y datos de cuenta enmascarados ----
+@pytest.mark.parametrize("method,path", [
+    ("get", "/status"), ("get", "/config"), ("post", "/config"), ("post", "/toggle-bot"),
+    ("post", "/cancel-orders"), ("post", "/close-position"), ("get", "/metrics"), ("get", "/brokers"),
+])
+def test_endpoints_require_token(client, monkeypatch, method, path):
+    monkeypatch.setenv("API_TOKEN", "s3creto")
+    r = getattr(client, method)(path)
+    assert r.status_code == 401
+    r = getattr(client, method)(path, headers={"Authorization": "Bearer otro"})
+    assert r.status_code == 401
+
+
+def test_token_accepted_in_bearer_and_x_api_key(client, monkeypatch, fake_trading_client):
+    monkeypatch.setenv("API_TOKEN", "s3creto")
+    assert client.get("/status", headers={"Authorization": "Bearer s3creto"}).status_code == 200
+    assert client.get("/status", headers={"X-API-Key": "s3creto"}).status_code == 200
+    r = client.post("/toggle-bot", json={"enabled": False, "close_positions": True},
+                    headers={"X-API-Key": "s3creto"})
+    assert r.status_code == 200
+    fake_trading_client.close_all_positions.assert_called_once()
+
+
+def test_health_is_public(client, monkeypatch):
+    monkeypatch.setenv("API_TOKEN", "s3creto")
+    assert client.get("/health").json() == {"ok": True}
+
+
+def test_without_token_auth_is_disabled(client, monkeypatch):
+    monkeypatch.delenv("API_TOKEN", raising=False)
+    assert client.get("/config").status_code == 200
+
+
+def test_status_masks_ibkr_account(client):
+    client.post("/config", json={"broker": "ibkr"})
+    conn = client.get("/status").json()["connection"]
+    assert conn["account"] == "DU****567" and conn["accounts"] == ["DU****567"]

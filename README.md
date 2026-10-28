@@ -49,6 +49,8 @@ API **FastAPI**, dashboard **Streamlit** y monitorización con logs JSON + **Pro
 3. Las claves **nunca** se escriben en código. En GitHub, añádelas como *Secrets*
    (`Settings → Secrets and variables → Actions`) con los mismos nombres.
 
+4. Define `API_TOKEN` (y, si vas a exponer el dashboard, `DASHBOARD_PASSWORD`); ver la sección 2.1.
+
 > Las claves de paper y live son distintas en Alpaca: para pasar a live cambia las claves en `.env`
 > **y** pon `CONFIRM_LIVE_TRADING=true`. Sin esa variable, la API devuelve 403 y el bot no opera en real.
 > La misma regla se aplica a Interactive Brokers (ver sección 9).
@@ -68,7 +70,25 @@ docker compose up -d --build
 
 Los tres servicios comparten la BD en el volumen `botdata`. Para Interactive Brokers con el
 contenedor de IB Gateway incluido: `docker compose --profile ibkr up -d --build` (ver sección 9). El bot arranca **pausado**:
-actívalo desde el dashboard o con `curl -X POST localhost:8000/toggle-bot -H 'Content-Type: application/json' -d '{"enabled": true}'`.
+actívalo desde el dashboard o con `curl -X POST localhost:8000/toggle-bot -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' -d '{"enabled": true}'`.
+
+### 2.1 Seguridad (API_TOKEN y puertos)
+
+La API de control puede liquidar posiciones, cambiar de broker o de riesgo, así que:
+
+- **`API_TOKEN`**: si está definido en `.env`, todas las rutas salvo `/health` exigen
+  `Authorization: Bearer <token>` o `X-API-Key: <token>` (si no, 401). El dashboard lo envía solo.
+  Si no lo defines, la API arranca **sin autenticación** y lo avisa en el log con un `WARNING`.
+  Genera uno con `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+- **`DASHBOARD_PASSWORD`**: contraseña opcional para abrir el dashboard (Streamlit no tiene
+  autenticación propia). Para acceso remoto, mejor un proxy con TLS y autenticación o una VPN.
+- **Puertos**: `docker compose` publica 8000, 8501 y 9100 **solo en `127.0.0.1`** del host
+  (`BIND_ADDR`). En local, el exporter escucha en `METRICS_ADDR` (por defecto `127.0.0.1`).
+- `/status` y `/brokers` enmascaran el número de cuenta de IBKR (`DU****567`).
+
+```bash
+curl -H "Authorization: Bearer $API_TOKEN" localhost:8000/status
+```
 
 ## 3. Ejecución local
 
@@ -93,7 +113,7 @@ El bot las relee en **cada iteración**; si cambia `mode`, se recrea el `Trading
 iteración ya opera con el nuevo broker. Las BDs antiguas se migran solas al arrancar.
 
 ```bash
-curl -X POST localhost:8000/config -H 'Content-Type: application/json' \
+curl -X POST localhost:8000/config -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' \
      -d '{"risk_pct": 0.5, "symbols": ["AAPL", "BTC/USD"]}'
 ```
 
@@ -114,8 +134,11 @@ laborables y publica los resultados como artefacto.
 
 ## 7. API
 
+Todas las rutas salvo `/health` exigen `API_TOKEN` si está definido (sección 2.1).
+
 | Método | Ruta | Descripción |
 |---|---|---|
+| GET | `/health` | Healthcheck (pública, sin token) |
 | GET | `/status` | Broker activo y estado de conexión, balance, PnL diario y flotante, posiciones, modo |
 | GET | `/brokers` | Brokers disponibles, activo, proveedor de datos y conexión de cada uno |
 | GET/POST | `/config` | Lee / actualiza configuración (live exige confirmación; cambiar de broker en live exige `confirm_live: true`, si no 409) |
@@ -173,8 +196,8 @@ IBKR_ACCOUNT=             # opcional, si tu login gestiona varias cuentas
 Después elige el broker desde el dashboard (*Broker activo → Interactive Brokers*) o con la API:
 
 ```bash
-curl -X POST localhost:8000/config -H 'Content-Type: application/json' -d '{"broker": "ibkr"}'
-curl localhost:8000/brokers      # estado de conexión
+curl -X POST localhost:8000/config -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' -d '{"broker": "ibkr"}'
+curl -H "Authorization: Bearer $API_TOKEN" localhost:8000/brokers      # estado de conexión
 ```
 
 `data_provider` permite combinar, p.ej., operar en IBKR con datos de Alpaca (`"data_provider": "alpaca"`).

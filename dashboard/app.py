@@ -5,6 +5,7 @@ Ejecutar: streamlit run dashboard/app.py
 """
 from __future__ import annotations
 
+import hmac
 import os
 
 import pandas as pd
@@ -14,12 +15,35 @@ import requests
 import streamlit as st
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
+# Mismo token que la API (API_TOKEN); se envía en cada petición si está definido.
+API_TOKEN = os.getenv("API_TOKEN", "").strip()
+# Contraseña opcional para abrir el dashboard (Streamlit no trae autenticación propia).
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
 
 st.set_page_config(page_title="Trading Bot", page_icon="📈", layout="wide")
 
 
+def require_password() -> None:
+    """Pide DASHBOARD_PASSWORD (si está definida) antes de mostrar nada."""
+    if not DASHBOARD_PASSWORD or st.session_state.get("auth_ok"):
+        return
+    st.title("🔒 Trading Bot")
+    typed = st.text_input("Contraseña del dashboard", type="password", key="dashboard_password")
+    if typed:
+        if hmac.compare_digest(typed.encode(), DASHBOARD_PASSWORD.encode()):
+            st.session_state["auth_ok"] = True
+            st.rerun()
+        st.error("Contraseña incorrecta")
+    st.stop()
+
+
+require_password()
+
+
 def call_api(method: str, path: str, **kw) -> tuple[object | None, str | None]:
     """Llama a la API y devuelve ``(datos, error)``; ``error`` es un texto legible o ``None``."""
+    if API_TOKEN:
+        kw["headers"] = {**kw.get("headers", {}), "Authorization": f"Bearer {API_TOKEN}"}
     try:
         r = requests.request(method, f"{API_URL}{path}", timeout=15, **kw)
     except requests.RequestException as exc:

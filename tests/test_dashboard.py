@@ -100,3 +100,20 @@ def test_non_json_error_does_not_crash(fake_api):
     fake_api.fail[("GET", "/metrics")] = FakeResponse(502, None, text="Bad Gateway")
     at = run_app()
     assert any("502: Bad Gateway" in e.value for e in at.error)
+
+
+def test_dashboard_sends_api_token(fake_api, monkeypatch):
+    monkeypatch.setenv("API_TOKEN", "s3creto")
+    run_app()
+    assert fake_api.calls and all(
+        c[2].get("headers", {}).get("Authorization") == "Bearer s3creto" for c in fake_api.calls)
+
+
+def test_dashboard_password_gate(fake_api, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "clave")
+    at = run_app()
+    assert not fake_api.calls  # no se consulta la API sin contraseña
+    at.text_input(key="dashboard_password").input("mala").run()
+    assert any("incorrecta" in e.value for e in at.error) and not fake_api.calls
+    at.text_input(key="dashboard_password").input("clave").run()
+    assert any(c[1] == "/status" for c in fake_api.calls)
