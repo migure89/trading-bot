@@ -269,9 +269,12 @@ with tab_ai:
         current_risk = min(max(float(cfg.get("risk_pct", 1.0)), RISK_STEP), RISK_PCT_MAX)
         risk = st.slider("% riesgo por operación", RISK_STEP, RISK_PCT_MAX, current_risk, RISK_STEP)
         symbols = st.text_input("Activos (separados por coma)", ",".join(cfg.get("symbols", [])))
+        rth = st.checkbox("Solo sesión regular (09:30–16:00 ET) en acciones",
+                          value=bool(cfg.get("regular_hours_only", True)),
+                          help="Excluye pre-market y after-hours de señales, ATR y backtests.")
         if st.form_submit_button("Guardar (hot-reload)"):
             act("POST", "/config", "Configuración guardada; el bot la aplicará en la próxima iteración.",
-                json={"strategy_params": new, "risk_pct": risk,
+                json={"strategy_params": new, "risk_pct": risk, "regular_hours_only": rth,
                       "symbols": [s.strip() for s in symbols.split(",") if s.strip()]})
     hist = metrics.get("optimization_history", [])
     if hist:

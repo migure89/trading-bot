@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from config.settings import (
     LOOKBACK_DAYS_MAX,
@@ -167,6 +167,7 @@ class ConfigUpdate(StrictModel):
     timeframe: Literal["1Min", "5Min", "15Min", "1Hour", "1Day"] | None = None
     loop_interval_sec: int | None = Field(None, ge=LOOP_INTERVAL_MIN, le=LOOP_INTERVAL_MAX)
     lookback_days: int | None = Field(None, ge=1, le=LOOKBACK_DAYS_MAX)
+    regular_hours_only: StrictBool | None = None
     strategy_params: StrategyParamsUpdate | None = None
     # Confirmación explícita para cambiar de broker estando (o pasando) a live.
     confirm_live: bool = False

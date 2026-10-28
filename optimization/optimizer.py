@@ -137,7 +137,8 @@ def run_feedback_loop(store: SettingsStore, provider, n_trials: int = 50,
     results, errors, skipped = [], [], []
     for symbol in cfg["symbols"]:
         try:
-            df = provider.get_bars(symbol, cfg["timeframe"], days=max(cfg["lookback_days"] * 3, 60))
+            df = provider.get_bars(symbol, cfg["timeframe"], days=max(cfg["lookback_days"] * 3, 60),
+                                   regular_hours=cfg.get("regular_hours_only", True))
             if len(df) < 200:
                 log.warning("datos insuficientes", extra={"symbol": symbol, "bars": len(df)})
                 skipped.append({"symbol": symbol, "bars": len(df)})

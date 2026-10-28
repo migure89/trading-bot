@@ -19,7 +19,7 @@ def test_routes_stock_and_crypto(ohlcv):
     stock, crypto = MagicMock(), MagicMock()
     stock.get_stock_bars.return_value = SimpleNamespace(df=_multi(ohlcv, "AAPL"))
     crypto.get_crypto_bars.return_value = SimpleNamespace(df=_multi(ohlcv, "BTC/USD"))
-    p = AlpacaDataProvider("k", "s", stock_client=stock, crypto_client=crypto)
+    p = AlpacaDataProvider("k", "s", stock_client=stock, crypto_client=crypto, regular_hours_only=False)
     assert len(p.get_bars("AAPL")) == len(ohlcv)
     assert len(p.get_bars("BTC/USD")) == len(ohlcv)
     assert is_crypto("BTC/USD") and not is_crypto("AAPL")

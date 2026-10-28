@@ -64,7 +64,8 @@ class TradingBot:
         if broker is None or provider is None:
             broker, provider = self.active(cfg)
         params = cfg["strategy_params"]
-        df = provider.get_bars(symbol, cfg["timeframe"], cfg["lookback_days"])
+        df = provider.get_bars(symbol, cfg["timeframe"], cfg["lookback_days"],
+                               regular_hours=cfg.get("regular_hours_only", True))
         action = latest_action(df, params)
         held = broker.position_qty(symbol)
         price = float(df["close"].iloc[-1]) if len(df) else 0.0

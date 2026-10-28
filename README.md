@@ -117,7 +117,7 @@ pytest -q && ruff check .
 
 Claves en la tabla `settings`: `mode`, `broker` (`alpaca` | `ibkr`), `data_provider`
 (`auto` = el del broker, `alpaca` o `ibkr`), `bot_enabled`, `symbols` (p.ej. `["AAPL","BTC/USD"]`),
-`risk_pct`, `timeframe`, `loop_interval_sec`, `lookback_days`, `strategy_params`.
+`risk_pct`, `timeframe`, `loop_interval_sec`, `lookback_days`, `regular_hours_only`, `strategy_params`.
 El bot las relee en **cada iteración**; si cambia `mode`, se recrea el `TradingClient` de Alpaca con
 `paper=True/False` o se reconecta a IBKR en el puerto paper/live; si cambia `broker`, la siguiente
 iteración ya opera con el nuevo broker. Las BDs antiguas se migran solas al arrancar.
@@ -126,6 +126,23 @@ iteración ya opera con el nuevo broker. Las BDs antiguas se migran solas al arr
 curl -X POST localhost:8000/config -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' \
      -d '{"risk_pct": 0.5, "symbols": ["AAPL", "BTC/USD"]}'
 ```
+
+### 4.1 Sesión regular (`regular_hours_only`)
+
+Por defecto (`true`) las barras intradía de **acciones** usadas por el bot, el backtest y el optimizador
+son solo de la **sesión regular** (09:30–16:00 ET), igual que `useRTH` en IBKR. El pre-market y el
+after-hours tienen poco volumen y distorsionan las señales, el ATR y el Sharpe.
+
+- **Alpaca:** se filtra con el calendario de mercado de Alpaca (festivos y cierres anticipados); si no
+  está disponible se usa 09:30–16:00 ET de lunes a viernes y se registra un único WARNING. Las barras de
+  `1Hour` se construyen a partir de barras de 30 min alineadas con la apertura (09:30, 10:30 … 15:30–16:00:
+  7 barras por día, como en IBKR). Cripto y `1Day` no se filtran.
+- **IBKR:** el valor se pasa como `useRTH` (`IBKR_USE_RTH` solo se usa cuando no llega la opción).
+- `"regular_hours_only": false` vuelve al horario extendido. `ALPACA_REGULAR_HOURS_ONLY` fija el valor por
+  defecto del proveedor de Alpaca cuando se usa fuera del bot.
+- **Sharpe:** se anualiza con las barras reales (mediana de barras por día × 252 días, o 365 si hay
+  barras en fin de semana, como en cripto): 7 × 252 en `1Hour` con sesión regular, ~16 × 252 con horario
+  extendido. Antes se usaba siempre 7 × 252.
 
 ## 5. Estrategia y riesgo
 
@@ -142,7 +159,8 @@ curl -X POST localhost:8000/config -H "Authorization: Bearer $API_TOKEN" -H 'Con
 
 `POST /config` rechaza con **422** claves desconocidas, `timeframe` fuera de
 `1Min|5Min|15Min|1Hour|1Day`, listas de `symbols` vacías o con símbolos inválidos (se normalizan a
-mayúsculas y sin duplicados), `lookback_days` > 3650, `risk_pct` fuera de (0, 10] y `strategy_params`
+mayúsculas y sin duplicados), `lookback_days` > 3650, `risk_pct` fuera de (0, 10],
+`regular_hours_only` que no sea booleano y `strategy_params`
 con claves desconocidas, tipos erróneos o reglas incoherentes (`ema_fast < ema_slow`,
 `rsi_oversold < rsi_overbought`). El kill switch se cambia con `/toggle-bot`, no con `/config`.
 
@@ -329,6 +347,7 @@ docker compose --profile ibkr up -d --build
 - Símbolos: `AAPL` → acción `SMART/USD`; `BTC/USD` → cripto `PAXOS` (configurable con `IBKR_*_EXCHANGE`).
 - Históricos con `reqHistoricalData` troceado (p.ej. 50 días por petición en barras de 1 h) y pausa de
   `IBKR_HIST_PACING_SEC` entre bloques para respetar el *pacing* de IBKR (~60 peticiones / 10 min).
+- `useRTH` sigue `regular_hours_only` (por defecto `true`, ver sección 4.1).
 - Órdenes a mercado: acciones `DAY`, cripto `IOC`. Acciones en cantidades enteras.
 - El kill switch usa `reqGlobalCancel`, que cancela **todas** las órdenes abiertas de la cuenta (también
   las manuales), y después liquida todas las posiciones a mercado.

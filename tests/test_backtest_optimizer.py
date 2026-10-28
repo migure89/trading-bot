@@ -48,7 +48,8 @@ class FlakyProvider:
     def __init__(self, ohlcv, failing=("AAPL",)):
         self.ohlcv, self.failing = ohlcv, set(failing)
 
-    def get_bars(self, symbol, timeframe="1Hour", days=30, end=None):
+    def get_bars(self, symbol, timeframe="1Hour", days=30, end=None, regular_hours=None):
+        self.regular_hours = regular_hours
         if symbol in self.failing:
             from data.base import DataProviderError
 

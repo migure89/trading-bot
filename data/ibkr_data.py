@@ -63,7 +63,9 @@ class IBKRDataProvider:
         self._sleep = sleep
 
     def get_bars(self, symbol: str, timeframe: str = "1Hour", days: int = 30,
-                 end: datetime | None = None) -> pd.DataFrame:
+                 end: datetime | None = None, regular_hours: bool | None = None) -> pd.DataFrame:
+        """``regular_hours`` -> ``useRTH`` (None = ``IBKR_USE_RTH``)."""
+        use_rth = self.conn.config.use_rth if regular_hours is None else bool(regular_hours)
         # Reutiliza el modo con el que ya esté conectado el broker; si no, paper.
         ib = self.conn.ensure_connected(self.conn.mode or self.default_mode)
         contract = self.conn.qualify(symbol)
@@ -78,7 +80,7 @@ class IBKRDataProvider:
             bars = self.conn.run(
                 ib.reqHistoricalDataAsync, contract, endDateTime=cursor,
                 durationStr=f"{chunk} D", barSizeSetting=bar_size, whatToShow=what,
-                useRTH=self.conn.config.use_rth, formatDate=2,
+                useRTH=use_rth, formatDate=2,
                 timeout=self.conn.config.request_timeout,
             )
             frames.append(bars_to_df(bars))

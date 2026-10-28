@@ -41,6 +41,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "timeframe": "1Hour",         # 1Min | 5Min | 15Min | 1Hour | 1Day
     "loop_interval_sec": 60,
     "lookback_days": 30,
+    "regular_hours_only": True,   # acciones: solo sesión regular (09:30-16:00 ET) en señales y backtests
     "strategy_params": {
         "ema_fast": 12,
         "ema_slow": 26,
@@ -236,6 +237,8 @@ class SettingsStore:
                     raise ValueError(f"{key} debe ser un entero entre {lo} y {hi}")
         if "bot_enabled" in changes and not isinstance(changes["bot_enabled"], bool):
             raise ValueError("bot_enabled debe ser true/false")
+        if "regular_hours_only" in changes and not isinstance(changes["regular_hours_only"], bool):
+            raise ValueError("regular_hours_only debe ser true/false")
         unknown = set(changes) - set(DEFAULT_SETTINGS)
         if unknown:
             raise ValueError(f"Claves desconocidas: {sorted(unknown)}")
