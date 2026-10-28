@@ -95,6 +95,10 @@ def test_main_exit_code_when_everything_fails(monkeypatch, tmp_path, ohlcv, caps
     assert out["results"] == [] and out["errors"][0]["symbol"] == "AAPL"
 
 
+GOOD_OOS = {"total_return": 0.02, "sharpe": 1.2, "max_drawdown": -0.03, "win_rate": 0.6,
+            "profit_factor": 1.5, "num_trades": 10}
+
+
 # --- Issue #11: --output y aplicar un informe ------------------------------------------------------
 def test_main_output_file_and_apply_report(monkeypatch, tmp_path, ohlcv, capsys):
     store = SettingsStore(tmp_path / "settings.db")
@@ -108,9 +112,78 @@ def test_main_output_file_and_apply_report(monkeypatch, tmp_path, ohlcv, capsys)
 
     # Fuerza un ganador y lo aplica sobre la BD con --apply-report.
     winner = {**report["results"][0]["best_params"], "ema_fast": 7, "ema_slow": 31}
-    report["results"][0].update(improved=True, best_params=winner)
+    report["results"][0].update(improved=True, best_params=winner, train_score=3.0, best_oos=GOOD_OOS)
     out_file.write_text(json.dumps(report))
     assert _main(monkeypatch, tmp_path, ["--apply-report", str(out_file)], None) == 0
     params = SettingsStore(tmp_path / "settings.db").load()["strategy_params"]
     assert params["ema_fast"] == 7 and params["ema_slow"] == 31
     assert json.loads(capsys.readouterr().out)["applied"]["symbol"] == "BTC/USD"
+
+
+# --- Issue #18: solo se aplican resultados con OOS positivo, suficientes operaciones y sin sobreajuste
+from optimization.optimizer import AcceptanceCriteria, apply_report, evaluate  # noqa: E402
+
+# Datos reales observados (Alpaca paper, 28-10-2026): mejores que los actuales pero con OOS negativo.
+AAPL_REAL = {"improved": True, "train_score": 3.517, "best_oos": {
+    "total_return": -0.00496, "sharpe": -0.243, "max_drawdown": -0.0297, "win_rate": 0.2,
+    "profit_factor": 0.84, "num_trades": 5}}
+MSFT_REAL = {"improved": True, "train_score": 3.442, "best_oos": {
+    "total_return": -0.00982, "sharpe": -0.451, "max_drawdown": -0.0596, "win_rate": 0.667,
+    "profit_factor": 0.921, "num_trades": 9}}
+
+
+def test_negative_oos_is_not_applicable():
+    ok, reasons = evaluate(MSFT_REAL)
+    assert not ok and any("Sharpe OOS" in r for r in reasons) and any("retorno OOS" in r for r in reasons)
+    ok, reasons = evaluate(AAPL_REAL)
+    assert not ok and any("operaciones OOS 5 < 8" == r for r in reasons)
+
+
+def test_few_trades_not_applicable():
+    ok, reasons = evaluate({"improved": True, "train_score": 2.0, "best_oos": {**GOOD_OOS, "num_trades": 4}})
+    assert not ok and reasons == ["operaciones OOS 4 < 8"]
+    assert evaluate({"improved": True, "train_score": 2.0, "best_oos": {**GOOD_OOS, "num_trades": 4}},
+                    AcceptanceCriteria(min_oos_trades=3))[0]
+
+
+def test_train_oos_gap_limits_overfitting():
+    res = {"improved": True, "train_score": 9.0, "best_oos": GOOD_OOS}
+    ok, reasons = evaluate(res)
+    assert not ok and "sobreajuste" in reasons[0]
+    assert evaluate(res, AcceptanceCriteria(max_train_oos_gap=10))[0]
+
+
+def test_positive_oos_with_improvement_is_applicable():
+    assert evaluate({"improved": True, "train_score": 3.0, "best_oos": GOOD_OOS}) == (True, [])
+    ok, reasons = evaluate({"improved": False, "train_score": 3.0, "best_oos": GOOD_OOS})
+    assert not ok and reasons == ["no mejora a los parámetros actuales fuera de muestra"]
+
+
+def test_criteria_from_env_and_overrides(monkeypatch):
+    monkeypatch.setenv("OPT_MIN_OOS_TRADES", "12")
+    monkeypatch.setenv("OPT_MIN_OOS_SHARPE", "0.5")
+    c = AcceptanceCriteria.from_env(max_train_oos_gap=1.5)
+    assert (c.min_oos_trades, c.min_oos_sharpe, c.min_oos_return, c.max_train_oos_gap) == (12, 0.5, 0.0, 1.5)
+    assert AcceptanceCriteria.from_env(min_oos_trades=3).min_oos_trades == 3
+
+
+def test_feedback_loop_does_not_apply_negative_oos(store, provider, monkeypatch):
+    import optimization.optimizer as opt
+    store.update({"symbols": ["AAPL", "MSFT"]})
+    before = store.load()["strategy_params"]
+    fake = iter([dict(AAPL_REAL, best_params={**before, "ema_fast": 7}, current_oos=AAPL_REAL["best_oos"]),
+                 dict(MSFT_REAL, best_params={**before, "ema_fast": 8}, current_oos=MSFT_REAL["best_oos"])])
+    monkeypatch.setattr(opt, "optimize", lambda *a, **k: next(fake))
+    report = opt.run_feedback_loop(store, provider, n_trials=1, apply=True)
+    assert report["applied"] is None and store.load()["strategy_params"] == before
+    assert [r["applicable"] for r in report["results"]] == [False, False]
+    assert all(r["rejected_reason"] for r in report["results"])
+    assert report["criteria"]["min_oos_trades"] == 8
+
+
+def test_apply_report_reevaluates_criteria(store, tmp_path):
+    before = store.load()["strategy_params"]
+    path = tmp_path / "r.json"
+    bad = dict(MSFT_REAL, symbol="MSFT", applicable=True, best_params={**before, "ema_fast": 9})
+    path.write_text(json.dumps({"results": [bad]}))
+    assert apply_report(store, str(path)) is None and store.load()["strategy_params"] == before

@@ -64,12 +64,13 @@ jobs:
           jq -e '.results | type == "array"' artifacts/optimization.json
           {
             echo "### Resultados de la optimización"
-            echo "| Símbolo | Mejora OOS | Sharpe OOS | Trades OOS |"
-            echo "|---|---|---|---|"
-            jq -r '.results[] | "| \(.symbol) | \(.improved) | \(.best_oos.sharpe) | \(.best_oos.num_trades) |"' artifacts/optimization.json
-            jq -r '.errors[] | "| \(.symbol) | error: \(.error) | | |"' artifacts/optimization.json
+            echo "| Símbolo | Mejora OOS | Aplicable | Sharpe OOS | Retorno OOS | Trades OOS | Motivo de rechazo |"
+            echo "|---|---|---|---|---|---|---|"
+            jq -r '.results[] | "| \(.symbol) | \(.improved) | \(.applicable) | \(.best_oos.sharpe * 100 | round / 100) | \(.best_oos.total_return * 10000 | round / 100) % | \(.best_oos.num_trades) | \((.rejected_reason // []) | join("; ")) |"' artifacts/optimization.json
+            jq -r '.errors[] | "| \(.symbol) | error: \(.error) | | | | | |"' artifacts/optimization.json
+            jq -r '"Criterios: " + (.criteria // {} | tostring)' artifacts/optimization.json
             echo
-            echo 'Para aplicar el ganador: descarga el artefacto y ejecuta `python -m optimization.optimizer --apply-report optimization.json` junto al bot.'
+            echo 'Para aplicar el ganador (solo los aplicables; se reevalúan los criterios): descarga el artefacto y ejecuta `python -m optimization.optimizer --apply-report optimization.json` junto al bot.'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()

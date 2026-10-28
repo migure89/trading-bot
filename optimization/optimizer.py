@@ -3,7 +3,8 @@
 Flujo (feedback loop):
 1. Evalúa los parámetros actuales sobre datos recientes (métricas en vivo/backtest).
 2. Busca nuevos parámetros con Optuna sobre un tramo de entrenamiento.
-3. Valida en un tramo fuera de muestra y sólo aplica si mejora al actual.
+3. Valida en un tramo fuera de muestra y sólo aplica si mejora al actual **y** supera los criterios
+   de aceptación (OOS con Sharpe y retorno mínimos, mínimo de operaciones y brecha train/OOS acotada).
 4. Guarda los ganadores en la BD; el bot los lee en caliente.
 """
 from __future__ import annotations
@@ -11,7 +12,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+from dataclasses import asdict, dataclass
 
 import optuna
 import pandas as pd
@@ -34,6 +37,53 @@ def objective_score(metrics: dict, max_dd_limit: float = -0.25) -> float:
     if metrics["max_drawdown"] < max_dd_limit:
         score -= 5.0 * (max_dd_limit - metrics["max_drawdown"]) * 10
     return float(score)
+
+
+@dataclass(frozen=True)
+class AcceptanceCriteria:
+    """Umbrales para que un resultado sea *aplicable* (además de mejorar a los parámetros actuales).
+
+    Configurables por CLI (``--min-oos-trades``…) o entorno (``OPT_MIN_OOS_TRADES``…).
+    """
+    min_oos_trades: int = 8           # operaciones mínimas en el tramo fuera de muestra
+    min_oos_sharpe: float = 0.0       # Sharpe OOS mínimo
+    min_oos_return: float = 0.0       # retorno total OOS mínimo (0.01 = 1 %)
+    max_train_oos_gap: float = 2.0    # máxima diferencia train_score - score OOS (sobreajuste)
+
+    ENV = {"min_oos_trades": "OPT_MIN_OOS_TRADES", "min_oos_sharpe": "OPT_MIN_OOS_SHARPE",
+           "min_oos_return": "OPT_MIN_OOS_RETURN", "max_train_oos_gap": "OPT_MAX_TRAIN_OOS_GAP"}
+
+    @classmethod
+    def from_env(cls, **overrides) -> AcceptanceCriteria:
+        values = {}
+        for field, var in cls.ENV.items():
+            cast = int if field == "min_oos_trades" else float
+            if overrides.get(field) is not None:
+                values[field] = cast(overrides[field])
+            elif os.getenv(var, "").strip():
+                values[field] = cast(os.environ[var])
+        return cls(**values)
+
+
+def evaluate(result: dict, criteria: AcceptanceCriteria | None = None) -> tuple[bool, list[str]]:
+    """``(aplicable, motivos_de_rechazo)`` de un resultado de :func:`optimize`."""
+    c = criteria or AcceptanceCriteria()
+    oos = result["best_oos"]
+    reasons = []
+    if not result.get("improved"):
+        reasons.append("no mejora a los parámetros actuales fuera de muestra")
+    if oos["num_trades"] < c.min_oos_trades:
+        reasons.append(f"operaciones OOS {oos['num_trades']} < {c.min_oos_trades}")
+    if oos["sharpe"] < c.min_oos_sharpe:
+        reasons.append(f"Sharpe OOS {oos['sharpe']:.2f} < {c.min_oos_sharpe:g}")
+    if oos["total_return"] < c.min_oos_return:
+        reasons.append(f"retorno OOS {oos['total_return']:.2%} < {c.min_oos_return:.2%}")
+    train = result.get("train_score")
+    if train is not None:
+        gap = float(train) - objective_score(oos)
+        if gap > c.max_train_oos_gap:
+            reasons.append(f"brecha train/OOS {gap:.2f} > {c.max_train_oos_gap:g} (sobreajuste)")
+    return not reasons, reasons
 
 
 def suggest_params(trial: optuna.Trial, base: dict) -> dict:
@@ -74,12 +124,15 @@ def optimize(df: pd.DataFrame, base_params: dict, n_trials: int = 50,
 
 
 def run_feedback_loop(store: SettingsStore, provider, n_trials: int = 50,
-                      apply: bool = True) -> dict:
-    """Reoptimiza cada símbolo configurado y aplica el mejor resultado global.
+                      apply: bool = True, criteria: AcceptanceCriteria | None = None) -> dict:
+    """Reoptimiza cada símbolo configurado y aplica el mejor resultado *aplicable*.
 
+    Cada resultado lleva ``applicable`` y ``rejected_reason`` (lista vacía si es aplicable).
     Un fallo en un símbolo (datos, proveedor caído…) se registra y no detiene el resto.
-    Devuelve ``{"results": [...], "errors": [{"symbol", "error"}], "skipped": [...], "applied": ...}``.
+    Devuelve ``{"results": [...], "errors": [{"symbol", "error"}], "skipped": [...], "applied": ...,
+    "criteria": {...}}``.
     """
+    criteria = criteria or AcceptanceCriteria.from_env()
     cfg = store.load()
     results, errors, skipped = [], [], []
     for symbol in cfg["symbols"]:
@@ -97,17 +150,24 @@ def run_feedback_loop(store: SettingsStore, provider, n_trials: int = 50,
             errors.append({"symbol": symbol, "error": error})
             continue
         res["symbol"] = symbol
+        res["applicable"], res["rejected_reason"] = evaluate(res, criteria)
         store.save_optimization(symbol, res["best_params"], res["best_oos"], False)
         log.info("optimización completada", extra={"symbol": symbol, "improved": res["improved"],
+                                                   "applicable": res["applicable"],
+                                                   "rejected_reason": res["rejected_reason"],
                                                    "oos": res["best_oos"]})
         results.append(res)
 
     applied = None
-    winners = [r for r in results if r["improved"]]
+    winners = [r for r in results if r["applicable"]]
     if apply and winners:
         best = max(winners, key=lambda r: objective_score(r["best_oos"]))
         applied = apply_params(store, best["best_params"], best["symbol"], best["best_oos"])
-    return {"results": results, "errors": errors, "skipped": skipped, "applied": applied}
+    elif apply and results:
+        log.info("ningún resultado cumple los criterios: no se aplican parámetros",
+                 extra={"criteria": asdict(criteria)})
+    return {"results": results, "errors": errors, "skipped": skipped, "applied": applied,
+            "criteria": asdict(criteria)}
 
 
 def apply_params(store: SettingsStore, params: dict, symbol: str, metrics: dict) -> dict:
@@ -118,13 +178,24 @@ def apply_params(store: SettingsStore, params: dict, symbol: str, metrics: dict)
     return {"symbol": symbol, "params": params}
 
 
-def apply_report(store: SettingsStore, path: str) -> dict | None:
-    """Aplica el mejor resultado *mejorado* de un JSON generado con ``--output`` (p.ej. el del CI)."""
+def apply_report(store: SettingsStore, path: str,
+                 criteria: AcceptanceCriteria | None = None) -> dict | None:
+    """Aplica el mejor resultado *aplicable* de un JSON generado con ``--output`` (p.ej. el del CI).
+
+    Los criterios se vuelven a evaluar al aplicar (no se confía en el ``applicable`` del fichero).
+    """
+    criteria = criteria or AcceptanceCriteria.from_env()
     with open(path, encoding="utf-8") as fh:
         report = json.load(fh)
-    winners = [r for r in report.get("results", []) if r.get("improved")]
+    winners = []
+    for r in report.get("results", []):
+        ok, reasons = evaluate(r, criteria)
+        if ok:
+            winners.append(r)
+        else:
+            log.info("resultado descartado", extra={"symbol": r.get("symbol"), "rejected_reason": reasons})
     if not winners:
-        log.info("el informe no tiene parámetros que mejoren a los actuales", extra={"file": path})
+        log.info("el informe no tiene parámetros aplicables", extra={"file": path})
         return None
     best = max(winners, key=lambda r: objective_score(r["best_oos"]))
     return apply_params(store, best["best_params"], best["symbol"], best["best_oos"])
@@ -145,12 +216,24 @@ def main() -> int:
     ap.add_argument("--output", "-o", default=None,
                     help="fichero donde escribir el resultado JSON (por defecto stdout)")
     ap.add_argument("--apply-report", metavar="FICHERO", default=None,
-                    help="no optimiza: aplica el mejor resultado mejorado de un JSON de --output")
+                    help="no optimiza: aplica el mejor resultado aplicable de un JSON de --output")
+    d = AcceptanceCriteria()
+    ap.add_argument("--min-oos-trades", type=int, default=None,
+                    help=f"operaciones OOS mínimas (OPT_MIN_OOS_TRADES, por defecto {d.min_oos_trades})")
+    ap.add_argument("--min-oos-sharpe", type=float, default=None,
+                    help=f"Sharpe OOS mínimo (OPT_MIN_OOS_SHARPE, por defecto {d.min_oos_sharpe:g})")
+    ap.add_argument("--min-oos-return", type=float, default=None,
+                    help=f"retorno OOS mínimo, 0.01 = 1 %% (OPT_MIN_OOS_RETURN, def. {d.min_oos_return:g})")
+    ap.add_argument("--max-train-oos-gap", type=float, default=None,
+                    help=f"brecha máx. train/OOS (OPT_MAX_TRAIN_OOS_GAP, def. {d.max_train_oos_gap:g})")
     args = ap.parse_args()
     store = SettingsStore()
+    criteria = AcceptanceCriteria.from_env(
+        min_oos_trades=args.min_oos_trades, min_oos_sharpe=args.min_oos_sharpe,
+        min_oos_return=args.min_oos_return, max_train_oos_gap=args.max_train_oos_gap)
 
     if args.apply_report:
-        applied = apply_report(store, args.apply_report)
+        applied = apply_report(store, args.apply_report, criteria)
         write_output({"applied": applied}, args.output)
         return 0
 
@@ -161,7 +244,7 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         log.error("proveedor de datos no disponible", extra={"provider": name, "error": str(exc)})
         return 2
-    report = run_feedback_loop(store, provider, args.trials, not args.no_apply)
+    report = run_feedback_loop(store, provider, args.trials, not args.no_apply, criteria)
     write_output(report, args.output)
     if report["errors"] and not report["results"]:
         log.error("ningún símbolo se pudo optimizar", extra={"errors": report["errors"]})

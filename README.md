@@ -151,15 +151,26 @@ con claves desconocidas, tipos erróneos o reglas incoherentes (`ema_fast < ema_
 `optimization/optimizer.py` divide el histórico reciente en entrenamiento (70 %) y validación (30 %),
 busca parámetros con Optuna (TPE) maximizando una puntuación compuesta (Sharpe + Profit Factor +
 Win Rate, penalizando drawdowns > 25 %) y **solo aplica** los nuevos si superan a los actuales fuera de
-muestra. Todo queda en `optimization_runs`. Usa el proveedor de datos de la configuración o el que
+muestra **y** cumplen los criterios de aceptación (si no, el resultado sale con `applicable: false` y
+`rejected_reason`). Todo queda en `optimization_runs`. Usa el proveedor de datos de la configuración o el que
 indiques: `python -m optimization.optimizer --provider ibkr` (con un `IBKR_CLIENT_ID` libre, p.ej. 3). El workflow `backtest_scheduled.yml` lo ejecuta en días
 laborables y publica los resultados como artefacto.
 
 - **Errores por símbolo:** si un símbolo falla (sin datos, sin claves de Alpaca para acciones, IBKR
   caído…) se registra y se sigue con el resto; el resultado incluye `errors: [{symbol, error}]`. El
   proceso sale con código 2 si no se pudo optimizar ningún símbolo o el proveedor no está disponible.
+- **Criterios de aceptación** (CLI o entorno; se vuelven a evaluar con `--apply-report`):
+
+  | Criterio | CLI | Entorno | Por defecto |
+  |---|---|---|---|
+  | Operaciones OOS mínimas | `--min-oos-trades` | `OPT_MIN_OOS_TRADES` | 8 |
+  | Sharpe OOS mínimo | `--min-oos-sharpe` | `OPT_MIN_OOS_SHARPE` | 0 |
+  | Retorno OOS mínimo (0.01 = 1 %) | `--min-oos-return` | `OPT_MIN_OOS_RETURN` | 0 |
+  | Brecha máx. `train_score` − puntuación OOS | `--max-train-oos-gap` | `OPT_MAX_TRAIN_OOS_GAP` | 2.0 |
+
 - **Salida:** stdout (o `--output fichero.json`) contiene solo el JSON
-  `{"results", "errors", "skipped", "applied"}`; los logs van por stderr.
+  `{"results", "errors", "skipped", "applied", "criteria"}`; cada resultado incluye `improved`,
+  `applicable` y `rejected_reason`. Los logs van por stderr.
 - **Cómo se aplican los parámetros:**
   1. *Junto al bot* (recomendado): `python -m optimization.optimizer --trials 100` sobre la BD real
      (p.ej. un cron en la misma máquina); solo aplica si mejora fuera de muestra y el bot lo lee en caliente.
