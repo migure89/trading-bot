@@ -5,7 +5,16 @@ import os
 
 from config.settings import LiveTradingNotConfirmed, live_trading_confirmed
 from data.base import is_crypto
-from execution.base import BaseBroker, BrokerConnectionError
+from execution.base import (
+    CANCELED,
+    FILLED,
+    PARTIAL,
+    PENDING,
+    REJECTED,
+    BaseBroker,
+    BrokerConnectionError,
+    fill_info,
+)
 
 
 def alpaca_credentials() -> tuple[str, str] | None:
@@ -110,6 +119,21 @@ class AlpacaBroker(BaseBroker):
             time_in_force=TimeInForce.GTC if is_crypto(symbol) else TimeInForce.DAY,
         )
         return self.client.submit_order(order_data=req)
+
+    _STATUS = {"filled": FILLED, "partially_filled": PARTIAL, "rejected": REJECTED,
+               "canceled": CANCELED, "expired": CANCELED, "done_for_day": CANCELED,
+               "replaced": CANCELED, "suspended": REJECTED}
+
+    def order_fill(self, order) -> dict:
+        """Relee la orden en Alpaca: ``filled_qty``, ``filled_avg_price`` y ``status``."""
+        try:
+            order = self.client.get_order_by_id(order.id)
+        except Exception:  # noqa: BLE001 - si falla la consulta usamos lo que devolvió submit
+            pass
+        raw = getattr(getattr(order, "status", None), "value", getattr(order, "status", None))
+        status = self._STATUS.get(str(raw or "").lower(), PENDING)
+        return fill_info(status, getattr(order, "filled_qty", None),
+                         getattr(order, "filled_avg_price", None))
 
     def close_position(self, symbol: str):
         return self.client.close_position(symbol.replace("/", ""))

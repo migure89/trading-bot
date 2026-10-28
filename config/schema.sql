@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS trades (
     mode        TEXT NOT NULL,
     broker      TEXT,                   -- alpaca | ibkr
     order_id    TEXT,
-    pnl         REAL,
+    pnl         REAL,                   -- PnL realizado (solo ventas ejecutadas)
+    status      TEXT,                   -- filled | partially_filled | pending
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );

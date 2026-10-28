@@ -14,7 +14,7 @@ from config.settings import LiveTradingNotConfirmed, SettingsStore, resolve_data
 from core.registry import resolve
 from data.base import is_crypto
 from data.factory import DataProviderRegistry
-from execution.base import BaseBroker, BrokerConnectionError
+from execution.base import CANCELED, FILLED, PARTIAL, REJECTED, BaseBroker, BrokerConnectionError
 from execution.factory import BrokerRegistry
 from monitoring import exporter
 from monitoring.logger import get_logger
@@ -49,22 +49,41 @@ class TradingBot:
             qty = broker.position_size(equity, cfg["risk_pct"], price, atr_v,
                                        float(params["atr_stop_mult"]), is_crypto(symbol))
             if qty > 0:
-                order = broker.market_order(symbol, qty, "buy")
-                self.store.record_trade(symbol, "buy", qty, price, cfg["mode"],
-                                        str(getattr(order, "id", "")), broker=broker.name)
-                exporter.ORDERS.labels(symbol, "buy").inc()
-                log.info("orden de compra", extra={"symbol": symbol, "qty": qty, "price": price,
-                                                   "broker": broker.name})
-                return "buy"
+                return self.execute(symbol, "buy", qty, price, cfg, broker)
         elif action == "sell" and held > 0:
-            order = broker.market_order(symbol, held, "sell")
-            self.store.record_trade(symbol, "sell", held, price, cfg["mode"],
-                                    str(getattr(order, "id", "")), broker=broker.name)
-            exporter.ORDERS.labels(symbol, "sell").inc()
-            log.info("orden de venta", extra={"symbol": symbol, "qty": held, "price": price,
-                                              "broker": broker.name})
-            return "sell"
+            pos = broker.position(symbol) or {}
+            return self.execute(symbol, "sell", held, price, cfg, broker,
+                                entry_price=pos.get("avg_entry_price"))
         return "hold"
+
+    def execute(self, symbol: str, side: str, qty: float, ref_price: float, cfg: dict,
+                broker: BaseBroker, entry_price: float | None = None) -> str:
+        """Envía la orden, espera su ejecución y registra precio/cantidad reales y el PnL.
+
+        Las órdenes rechazadas o canceladas sin ejecutar no se registran como trades.
+        """
+        order = broker.market_order(symbol, qty, side)
+        fill = broker.wait_fill(order)
+        order_id = str(getattr(order, "id", ""))
+        if fill["status"] in (REJECTED, CANCELED):
+            exporter.ERRORS.inc()
+            log.warning("orden no ejecutada", extra={"symbol": symbol, "side": side, "qty": qty,
+                                                     "status": fill["status"], "order_id": order_id,
+                                                     "broker": broker.name})
+            return fill["status"]
+        executed = fill["filled_qty"] if fill["status"] in (FILLED, PARTIAL) and fill["filled_qty"] else qty
+        price = fill["avg_price"] or ref_price
+        pnl = None
+        if side == "sell" and fill["status"] in (FILLED, PARTIAL) and fill["avg_price"] and entry_price:
+            # PnL realizado = (precio de venta - precio medio de entrada) * cantidad vendida
+            pnl = round((fill["avg_price"] - float(entry_price)) * executed, 6)
+        self.store.record_trade(symbol, side, executed, price, cfg["mode"], order_id, pnl=pnl,
+                                broker=broker.name, status=fill["status"])
+        exporter.ORDERS.labels(symbol, side).inc()
+        log.info(f"orden de {'compra' if side == 'buy' else 'venta'}",
+                 extra={"symbol": symbol, "qty": executed, "price": price, "status": fill["status"],
+                        "pnl": pnl, "broker": broker.name})
+        return side
 
     def iteration(self) -> dict:
         cfg = self.store.load()  # hot-reload

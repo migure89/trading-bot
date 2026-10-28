@@ -161,6 +161,8 @@ class SettingsStore:
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(trades)")}
             if "broker" not in cols:
                 conn.execute("ALTER TABLE trades ADD COLUMN broker TEXT")
+            if "status" not in cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN status TEXT")
             for key, value in DEFAULT_SETTINGS.items():
                 conn.execute(
                     "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
@@ -266,12 +268,12 @@ class SettingsStore:
 
     def record_trade(self, symbol: str, side: str, qty: float, price: float | None,
                      mode: str, order_id: str | None = None, pnl: float | None = None,
-                     broker: str | None = None) -> None:
+                     broker: str | None = None, status: str | None = None) -> None:
         with self._lock, self._conn() as conn:
             conn.execute(
-                "INSERT INTO trades(symbol, side, qty, price, mode, broker, order_id, pnl) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (symbol, side, qty, price, mode, broker, order_id, pnl),
+                "INSERT INTO trades(symbol, side, qty, price, mode, broker, order_id, pnl, status) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (symbol, side, qty, price, mode, broker, order_id, pnl, status),
             )
 
     def trades(self, limit: int = 500) -> list[dict]:

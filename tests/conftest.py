@@ -46,6 +46,9 @@ def fake_trading_client():
         equity="100000", last_equity="99000", cash="50000", buying_power="100000")
     client.get_all_positions.return_value = []
     client.submit_order.return_value = SimpleNamespace(id="order-1")
+    # Orden ya ejecutada al consultarla (precio/cantidad reales opcionales)
+    client.get_order_by_id.side_effect = lambda oid: SimpleNamespace(
+        id=oid, status="filled", filled_qty=None, filled_avg_price=None)
     return client
 
 
@@ -66,6 +69,7 @@ class FakeIB:
         self.connected = False
         self.accounts = list(accounts)
         self.bars = bars or []
+        self.fill_price = 100.0
         self.portfolio_items = list(portfolio or [])
         self.fail_connect = fail_connect
         self.connect_calls: list[tuple] = []
@@ -123,7 +127,9 @@ class FakeIB:
         self._next_id += 1
         order.orderId = self._next_id
         self.orders.append((contract, order))
-        return SimpleNamespace(order=order, orderStatus=SimpleNamespace(status="Submitted"))
+        status = SimpleNamespace(status="Filled", filled=order.totalQuantity,
+                                 avgFillPrice=self.fill_price)
+        return SimpleNamespace(order=order, orderStatus=status)
 
     def reqGlobalCancel(self):
         self.global_cancels += 1
