@@ -98,9 +98,13 @@ curl -H "Authorization: Bearer $API_TOKEN" localhost:8000/status
 
 ## 3. Ejecución local
 
+Versión de Python: **3.12** (la misma que el CI y la imagen Docker). `requirements.txt` contiene las
+dependencias de ejecución con rangos acotados por versión mayor y `requirements-dev.txt` añade las de
+tests y lint; Dependabot (`.github/dependabot.yml`) propone las actualizaciones.
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt         # o requirements.txt si solo vas a ejecutar
 python main.py --once                       # una iteración de prueba
 python main.py                              # bucle continuo
 uvicorn api.main:app --reload               # API

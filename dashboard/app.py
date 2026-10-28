@@ -225,10 +225,10 @@ tab_pos, tab_perf, tab_ai = st.tabs(["Posiciones", "Rendimiento", "Parámetros I
 with tab_pos:
     if positions:
         dfp = pd.DataFrame(positions)
-        st.dataframe(dfp, use_container_width=True, hide_index=True)
+        st.dataframe(dfp, width="stretch", hide_index=True)
         fig = px.bar(dfp, x="symbol", y="unrealized_pl", color="unrealized_pl",
                      color_continuous_scale="RdYlGn", title="PnL no realizado por posición")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         for p in positions:
             if st.button(f"Cerrar {p['symbol']} ({p['qty']})", key=f"close_{p['symbol']}"):
                 act("POST", "/close-position", f"Posición {p['symbol']} cerrada",
@@ -249,8 +249,8 @@ with tab_perf:
         trades["cum_pnl"] = trades["pnl"].fillna(0).cumsum()
         fig = go.Figure(go.Scatter(x=trades["created_at"], y=trades["cum_pnl"], mode="lines+markers"))
         fig.update_layout(title="PnL realizado acumulado")
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(trades, use_container_width=True, hide_index=True)
+        st.plotly_chart(fig, width="stretch")
+        st.dataframe(trades, width="stretch", hide_index=True)
     else:
         st.write("Todavía no hay operaciones registradas.")
 
@@ -279,5 +279,5 @@ with tab_ai:
         st.subheader("Historial de optimizaciones")
         if "metrics.sharpe" in dfh:
             st.plotly_chart(px.line(dfh.iloc[::-1], x="created_at", y="metrics.sharpe", color="symbol",
-                                    markers=True, title="Sharpe fuera de muestra"), use_container_width=True)
-        st.dataframe(dfh, use_container_width=True, hide_index=True)
+                                    markers=True, title="Sharpe fuera de muestra"), width="stretch")
+        st.dataframe(dfh, width="stretch", hide_index=True)
