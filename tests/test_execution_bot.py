@@ -149,3 +149,84 @@ def test_ibkr_order_fill_statuses():
     assert broker.order_fill(order(status="Submitted", filled=2, avgFillPrice=10))["status"] == \
         "partially_filled"
     assert broker.order_fill(order(status="PreSubmitted", filled=0, avgFillPrice=0))["status"] == "pending"
+
+
+# ---- issues #7 y #9: pausa sin broker, backoff, logs deduplicados y métricas ----
+def _metric(name, **labels):
+    from prometheus_client import REGISTRY
+    return REGISTRY.get_sample_value(name, labels)
+
+
+class ExplodingBroker:
+    """Broker que falla siempre al conectar y cuenta las llamadas."""
+
+    name = "ibkr"
+
+    def __init__(self, error="Gateway caído"):
+        self.calls, self.error = 0, error
+
+    def ensure_mode(self, mode):
+        self.calls += 1
+        raise ValueError(self.error)   # no es BrokerConnectionError: también debe tratarse
+
+
+def test_paused_bot_does_not_touch_broker(store, provider, caplog):
+    broker = ExplodingBroker()
+    bot = TradingBot(store, provider, broker)
+    store.update({"broker": "ibkr"})
+    with caplog.at_level("INFO", logger="bot"):
+        for _ in range(3):
+            assert bot.iteration()["status"] == "paused"
+    assert broker.calls == 0
+    assert [r.msg for r in caplog.records].count("bot en pausa (kill switch)") == 1
+    assert _metric("bot_enabled") == 0 and _metric("bot_info", broker="ibkr", mode="paper") == 1
+
+
+def test_broker_failures_backoff_and_dedup(store, provider, caplog):
+    broker = ExplodingBroker()
+    bot = TradingBot(store, provider, broker)
+    store.update({"broker": "ibkr", "bot_enabled": True})
+    with caplog.at_level("DEBUG", logger="bot"):
+        delays = []
+        for _ in range(6):
+            assert bot.iteration()["status"] == "broker_unavailable"
+            delays.append(bot.next_delay(60))
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1 and not any(r.exc_info for r in caplog.records)   # sin tracebacks
+    assert delays == [60, 120, 240, 300, 300, 300]
+    # bot_enabled refleja la configuración aunque el broker esté caído (#9)
+    assert _metric("bot_enabled") == 1 and _metric("bot_broker_connected", broker="ibkr") == 0
+
+    broker.error = "otro error"                      # error distinto: nuevo ERROR
+    with caplog.at_level("DEBUG", logger="bot"):
+        bot.iteration()
+    assert sum(r.levelname == "ERROR" for r in caplog.records) == 2
+
+
+def test_reconnect_resets_backoff(store, provider, fake_trading_client, caplog, monkeypatch):
+    import main
+    monkeypatch.setattr(main, "latest_action", lambda df, p: "hold")
+    broker, _ = make_broker(fake_trading_client)
+    bot = TradingBot(store, provider, broker)
+    bot._failures, bot._last_error = 3, ("alpaca", "x")
+    store.update({"bot_enabled": True, "symbols": ["AAPL"]})
+    with caplog.at_level("INFO", logger="bot"):
+        assert bot.iteration()["status"] == "ok"
+    assert bot.next_delay(60) == 60
+    assert any(r.msg == "broker reconectado" for r in caplog.records)
+    assert _metric("bot_broker_connected", broker="alpaca") == 1
+    assert _metric("bot_last_success_timestamp_seconds") > 0
+
+
+def test_alpaca_without_keys_single_clear_error(store, provider, monkeypatch, caplog):
+    monkeypatch.delenv("APCA_API_KEY_ID", raising=False)
+    monkeypatch.delenv("APCA_API_SECRET_KEY", raising=False)
+    bot = TradingBot(store, provider, AlpacaBroker())
+    store.update({"bot_enabled": True})
+    with caplog.at_level("INFO", logger="bot"):
+        for _ in range(3):
+            assert bot.iteration()["status"] == "broker_unavailable"
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1 and errors[0].exc_info is None
+    assert "APCA_API_KEY_ID" in errors[0].error
+    assert _metric("bot_broker_connected", broker="alpaca") == 0

@@ -14,7 +14,7 @@ from config.settings import LiveTradingNotConfirmed, SettingsStore, resolve_data
 from core.registry import resolve
 from data.base import is_crypto
 from data.factory import DataProviderRegistry
-from execution.base import CANCELED, FILLED, PARTIAL, REJECTED, BaseBroker, BrokerConnectionError
+from execution.base import CANCELED, FILLED, PARTIAL, REJECTED, BaseBroker
 from execution.factory import BrokerRegistry
 from monitoring import exporter
 from monitoring.logger import get_logger
@@ -23,6 +23,8 @@ from strategies.indicators import atr
 
 log = get_logger("bot")
 
+BACKOFF_MAX_SEC = 300  # tope del backoff exponencial ante fallos del broker
+
 
 class TradingBot:
     """``provider`` y ``broker`` pueden ser una instancia fija o un registro (selección en caliente)."""
@@ -30,6 +32,10 @@ class TradingBot:
     def __init__(self, store: SettingsStore, provider, broker) -> None:
         self.store, self.provider, self.broker = store, provider, broker
         self.running = True
+        self._paused: bool | None = None           # para registrar la pausa solo al cambiar
+        self._failures = 0                          # fallos consecutivos del broker (backoff)
+        self._last_error: tuple[str, str] | None = None
+        self._last_broker: str | None = None
 
     def active(self, cfg: dict) -> tuple[BaseBroker, object]:
         return resolve(self.broker, cfg["broker"]), resolve(self.provider, resolve_data_provider(cfg))
@@ -88,24 +94,31 @@ class TradingBot:
     def iteration(self) -> dict:
         cfg = self.store.load()  # hot-reload
         exporter.ITERATIONS.inc()
+        exporter.update_config(cfg)          # bot_enabled / bot_live_mode / bot_info, pase lo que pase
+        if not cfg["bot_enabled"]:
+            # En pausa no se toca el broker (ni conexiones ni llamadas de trading).
+            if self._paused is not True:
+                log.info("bot en pausa (kill switch)", extra={"mode": cfg["mode"], "broker": cfg["broker"]})
+            self._paused = True
+            exporter.LAST_SUCCESS.set_to_current_time()
+            return {"status": "paused", "broker": cfg["broker"]}
+        if self._paused:
+            log.info("bot reanudado", extra={"mode": cfg["mode"], "broker": cfg["broker"]})
+        self._paused = False
+
         broker, provider = self.active(cfg)
         try:
             broker.ensure_mode(cfg["mode"])
+            account = broker.account()
+            positions = broker.positions()
         except LiveTradingNotConfirmed as exc:
-            log.error(str(exc))
+            self._broker_failed(broker.name, str(exc))
             return {"status": "blocked_live"}
-        except BrokerConnectionError as exc:
-            exporter.BROKER_CONNECTED.labels(broker.name).set(0)
-            exporter.ERRORS.inc()
-            log.error("broker no disponible", extra={"broker": broker.name, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - cualquier fallo del broker (red, claves, Gateway…)
+            self._broker_failed(broker.name, str(exc) or type(exc).__name__)
             return {"status": "broker_unavailable", "broker": broker.name, "error": str(exc)}
-        exporter.BROKER_CONNECTED.labels(broker.name).set(1)
-        account = broker.account()
-        positions = broker.positions()
-        exporter.update_account(account, len(positions), cfg["bot_enabled"], cfg["mode"])
-        if not cfg["bot_enabled"]:
-            log.info("bot en pausa (kill switch)", extra={"mode": cfg["mode"], "broker": broker.name})
-            return {"status": "paused", "broker": broker.name}
+        self._broker_ok(broker.name)
+        exporter.update_account(account, len(positions))
         actions = {}
         for symbol in cfg["symbols"]:
             try:
@@ -114,7 +127,32 @@ class TradingBot:
                 exporter.ERRORS.inc()
                 log.exception("error procesando símbolo", extra={"symbol": symbol})
                 actions[symbol] = "error"
+        exporter.LAST_SUCCESS.set_to_current_time()
         return {"status": "ok", "broker": broker.name, "actions": actions}
+
+    # ---- estado de conexión: deduplicación de logs y backoff --------------
+    def _broker_failed(self, name: str, error: str) -> None:
+        exporter.set_broker_connected(name, False, self._last_broker)
+        exporter.ERRORS.inc()
+        self._failures += 1
+        key = (name, error)
+        if key != self._last_error:          # primer fallo o error distinto: un único ERROR
+            log.error("broker no disponible", extra={"broker": name, "error": error})
+        else:
+            log.debug("broker sigue sin responder", extra={"broker": name, "failures": self._failures})
+        self._last_error, self._last_broker = key, name
+
+    def _broker_ok(self, name: str) -> None:
+        if self._failures:
+            log.info("broker reconectado", extra={"broker": name, "failures": self._failures})
+        exporter.set_broker_connected(name, True, self._last_broker)
+        self._failures, self._last_error, self._last_broker = 0, None, name
+
+    def next_delay(self, interval: int) -> int:
+        """Espera hasta la siguiente iteración: backoff exponencial (máx. 5 min) si el broker falla."""
+        if not self._failures:
+            return interval
+        return int(min(max(interval, 5) * 2 ** (self._failures - 1), max(BACKOFF_MAX_SEC, interval)))
 
     def run(self) -> None:
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "running", False))
@@ -124,7 +162,7 @@ class TradingBot:
             except Exception:
                 exporter.ERRORS.inc()
                 log.exception("error en iteración")
-            interval = int(self.store.get("loop_interval_sec", 60))
+            interval = self.next_delay(int(self.store.get("loop_interval_sec", 60)))
             for _ in range(interval):
                 if not self.running:
                     break

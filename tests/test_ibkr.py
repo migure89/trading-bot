@@ -224,6 +224,6 @@ def test_bot_hot_switches_broker(store, fake_trading_client, ibkr_conn, fake_ib,
 def test_bot_reports_broker_unavailable(store):
     fake = FakeIB(fail_connect=True)
     bot = TradingBot(store, IBKRDataProvider(make_conn(fake)), IBKRBroker(make_conn(fake)))
-    store.update({"broker": "ibkr"})
+    store.update({"broker": "ibkr", "bot_enabled": True})   # en pausa ni siquiera se conecta (#7)
     out = bot.iteration()
     assert out["status"] == "broker_unavailable" and out["broker"] == "ibkr"

@@ -128,6 +128,19 @@ curl -X POST localhost:8000/config -H "Authorization: Bearer $API_TOKEN" -H 'Con
 - **Entrada:** EMA rápida > EMA lenta, RSI < sobrecompra y cierre < Bollinger superior.
 - **Salida:** cruce bajista de EMAs o RSI > sobrecompra.
 - **Tamaño:** `(equity × risk_pct%) / (ATR × atr_stop_mult)`, limitado al equity.
+- **Registro de operaciones:** tras enviar la orden, el bot espera hasta `ORDER_FILL_TIMEOUT` s
+  (10 por defecto) y guarda el **precio medio y la cantidad ejecutados** y el estado (`filled`,
+  `partially_filled` o `pending` si aún no se ha llenado). Las órdenes rechazadas o canceladas sin
+  ejecutar no cuentan como trades. En las ventas se guarda el **PnL realizado**:
+  `(precio de venta − avg_entry_price del broker) × cantidad` (sin comisiones).
+
+### 5.1 Validación de la configuración
+
+`POST /config` rechaza con **422** claves desconocidas, `timeframe` fuera de
+`1Min|5Min|15Min|1Hour|1Day`, listas de `symbols` vacías o con símbolos inválidos (se normalizan a
+mayúsculas y sin duplicados), `lookback_days` > 3650, `risk_pct` fuera de (0, 10] y `strategy_params`
+con claves desconocidas, tipos erróneos o reglas incoherentes (`ema_fast < ema_slow`,
+`rsi_oversold < rsi_overbought`). El kill switch se cambia con `/toggle-bot`, no con `/config`.
 
 ## 6. Autoaprendizaje
 
@@ -152,6 +165,39 @@ Todas las rutas salvo `/health` exigen `API_TOKEN` si está definido (sección 2
 | POST | `/cancel-orders` | Cancela todas las órdenes abiertas del broker activo |
 | POST | `/close-position` | Cierra una posición concreta |
 | GET | `/metrics` | Métricas, operaciones e historial de optimización |
+
+### 7.1 Monitorización (Prometheus)
+
+| Métrica | Descripción |
+|---|---|
+| `bot_enabled`, `bot_live_mode` | Estado configurado; se actualiza al principio de cada iteración aunque el broker falle |
+| `bot_info{broker,mode}` | Broker y modo configurados (valor 1) |
+| `bot_broker_connected{broker}` | 1 si el broker activo responde, 0 ante cualquier fallo (incluida la falta de credenciales) |
+| `bot_last_success_timestamp_seconds` | Última iteración correcta (también las de pausa) |
+| `bot_equity_usd`, `bot_daily_pnl_usd`, `bot_open_positions` | Cuenta del broker (solo se refrescan con el bot activo) |
+| `bot_orders_total`, `bot_errors_total`, `bot_iterations_total` | Contadores |
+
+Con el bot **en pausa** no se conecta al broker. Si el broker falla, el bot reintenta con backoff
+exponencial (`loop_interval_sec` × 2ⁿ, máximo 5 min) y solo escribe un ERROR cuando cambia el error;
+al recuperarse escribe `broker reconectado`.
+
+Ejemplo de reglas de alerta:
+
+```yaml
+groups:
+  - name: trading-bot
+    rules:
+      - alert: BotColgado
+        expr: time() - bot_last_success_timestamp_seconds > 600
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "El bot no completa una iteración desde hace más de 10 min"}
+      - alert: BrokerDesconectado
+        expr: bot_enabled == 1 and on() max(bot_broker_connected) == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "Bot activo pero el broker no responde"}
+```
 
 ## 8. Gestión del proyecto
 
