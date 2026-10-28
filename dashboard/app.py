@@ -18,17 +18,53 @@ API_URL = os.getenv("API_URL", "http://localhost:8000")
 st.set_page_config(page_title="Trading Bot", page_icon="📈", layout="wide")
 
 
-def api(method: str, path: str, **kw):
+def call_api(method: str, path: str, **kw) -> tuple[object | None, str | None]:
+    """Llama a la API y devuelve ``(datos, error)``; ``error`` es un texto legible o ``None``."""
     try:
         r = requests.request(method, f"{API_URL}{path}", timeout=15, **kw)
-        if r.status_code >= 400:
-            st.error(f"{r.status_code}: {r.json().get('detail', r.text)}")
-            return None
-        return r.json()
     except requests.RequestException as exc:
-        st.error(f"No se puede conectar con la API ({API_URL}): {exc}")
-        return None
+        return None, f"No se puede conectar con la API ({API_URL}): {exc}"
+    try:
+        data = r.json()
+    except ValueError:  # respuesta no JSON (p.ej. proxy o 500 en texto plano)
+        data = None
+    if r.status_code >= 400:
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return None, f"{r.status_code}: {detail or r.text[:300] or r.reason}"
+    return data, None
 
+
+def api(method: str, path: str, **kw):
+    """Lectura: muestra el error en la página y devuelve los datos o ``None``."""
+    data, err = call_api(method, path, **kw)
+    if err:
+        st.error(err)
+    return data
+
+
+def flash(kind: str, msg: str) -> None:
+    """Mensaje que sobrevive a ``st.rerun()`` y se muestra arriba en la siguiente ejecución."""
+    st.session_state["flash"] = (kind, msg)
+
+
+def act(method: str, path: str, ok_msg: str, **kw) -> bool:
+    """Acción del usuario: guarda el resultado (éxito o error) como flash y recarga la página.
+
+    Antes se hacía ``api(...)`` seguido de ``st.rerun()``, que borraba el ``st.error`` antes de
+    que el usuario pudiera verlo (p.ej. un kill switch que fallaba sin avisar).
+    """
+    _, err = call_api(method, path, **kw)
+    if err:
+        flash("error", f"❌ No se pudo completar la acción: {err}")
+    else:
+        flash("success", ok_msg)
+    st.rerun()
+    return err is None  # solo se alcanza fuera de Streamlit (st.rerun lanza una excepción)
+
+
+_flash = st.session_state.pop("flash", None)
+if _flash:
+    getattr(st, _flash[0])(_flash[1])
 
 status = api("GET", "/status") or {}
 cfg = api("GET", "/config") or {}
@@ -46,12 +82,9 @@ with st.sidebar:
             st.warning("Vas a operar con DINERO REAL. Requiere CONFIRM_LIVE_TRADING=true en el servidor.")
             confirm = st.text_input("Escribe CONFIRMAR para continuar")
             if st.button("Activar LIVE", type="primary", disabled=confirm != "CONFIRMAR"):
-                if api("POST", "/config", json={"mode": "live"}):
-                    st.success("Modo LIVE activado")
-                    st.rerun()
+                act("POST", "/config", "Modo LIVE activado", json={"mode": "live"})
         elif st.button("Volver a PAPER"):
-            api("POST", "/config", json={"mode": "paper"})
-            st.rerun()
+            act("POST", "/config", "Modo PAPER activado", json={"mode": "paper"})
 
     # ---- broker activo y estado de conexión ----
     st.divider()
@@ -79,15 +112,13 @@ with st.sidebar:
             ok = typed == "CONFIRMAR"
             payload["confirm_live"] = True
         if st.button(f"Cambiar a {labels.get(new_broker, new_broker)}", disabled=not ok):
-            if api("POST", "/config", json=payload):
-                st.rerun()
+            act("POST", "/config", f"Broker cambiado a {labels.get(new_broker, new_broker)}", json=payload)
     dp_opts = ["auto", "alpaca", "ibkr"]
     current_dp = cfg.get("data_provider", "auto")
     new_dp = st.selectbox("Datos de mercado", dp_opts, index=dp_opts.index(current_dp),
                           format_func=lambda d: "Auto (mismo que el broker)" if d == "auto" else labels[d])
     if new_dp != current_dp and st.button("Guardar proveedor de datos"):
-        api("POST", "/config", json={"data_provider": new_dp})
-        st.rerun()
+        act("POST", "/config", "Proveedor de datos guardado", json={"data_provider": new_dp})
     with st.expander("Conexiones"):
         for name, info in (brokers_info.get("connections") or {}).items():
             if info.get("connected"):
@@ -100,15 +131,25 @@ with st.sidebar:
     enabled = cfg.get("bot_enabled", False)
     st.markdown(f"**Bot:** {'▶️ activo' if enabled else '⏸️ pausado'}")
     if st.button("⏸️ Pausar bot" if enabled else "▶️ Arrancar bot"):
-        api("POST", "/toggle-bot", json={"enabled": not enabled})
-        st.rerun()
+        act("POST", "/toggle-bot", "Bot pausado" if enabled else "Bot arrancado",
+            json={"enabled": not enabled})
     st.divider()
-    if st.button("🛑 KILL SWITCH: pausar y cerrar todo", type="primary"):
-        api("POST", "/toggle-bot", json={"enabled": False, "close_positions": True})
-        st.rerun()
+    if st.button("🛑 KILL SWITCH: pausar y cerrar todo", type="primary", key="kill"):
+        st.session_state["kill_confirm"] = True
+    if st.session_state.get("kill_confirm"):
+        st.error(f"⚠️ Esto **pausa el bot**, cancela **todas** las órdenes abiertas y cierra **todas** las "
+                 f"posiciones a mercado en {labels.get(current_broker, current_broker)} "
+                 f"({'LIVE, dinero real' if mode == 'live' else 'paper'}).")
+        k1, k2 = st.columns(2)
+        if k1.button("Sí, cerrar todo", type="primary", key="kill_yes"):
+            st.session_state["kill_confirm"] = False
+            act("POST", "/toggle-bot", "🛑 Kill switch ejecutado: bot pausado y posiciones cerradas",
+                json={"enabled": False, "close_positions": True})
+        if k2.button("Cancelar", key="kill_no"):
+            st.session_state["kill_confirm"] = False
+            st.rerun()
     if st.button("✖️ Cancelar órdenes abiertas"):
-        if api("POST", "/cancel-orders"):
-            st.success("Órdenes canceladas")
+        act("POST", "/cancel-orders", "Órdenes canceladas")
 
 st.title("📈 Plataforma de Trading Cuantitativo")
 if status.get("error"):
@@ -134,8 +175,8 @@ with tab_pos:
         st.plotly_chart(fig, use_container_width=True)
         for p in positions:
             if st.button(f"Cerrar {p['symbol']} ({p['qty']})", key=f"close_{p['symbol']}"):
-                api("POST", "/close-position", json={"symbol": p["symbol"]})
-                st.rerun()
+                act("POST", "/close-position", f"Posición {p['symbol']} cerrada",
+                    json={"symbol": p["symbol"]})
     else:
         st.write("Sin posiciones abiertas.")
 
@@ -168,9 +209,9 @@ with tab_ai:
         risk = st.slider("% riesgo por operación", 0.1, 5.0, float(cfg.get("risk_pct", 1.0)), 0.1)
         symbols = st.text_input("Activos (separados por coma)", ",".join(cfg.get("symbols", [])))
         if st.form_submit_button("Guardar (hot-reload)"):
-            api("POST", "/config", json={"strategy_params": new, "risk_pct": risk,
-                                         "symbols": [s.strip() for s in symbols.split(",") if s.strip()]})
-            st.success("Configuración guardada; el bot la aplicará en la próxima iteración.")
+            act("POST", "/config", "Configuración guardada; el bot la aplicará en la próxima iteración.",
+                json={"strategy_params": new, "risk_pct": risk,
+                      "symbols": [s.strip() for s in symbols.split(",") if s.strip()]})
     hist = metrics.get("optimization_history", [])
     if hist:
         dfh = pd.json_normalize(hist)
