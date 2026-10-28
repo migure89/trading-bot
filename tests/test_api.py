@@ -1,7 +1,10 @@
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
 from api import main as api_main
+from config.settings import TIMEFRAMES, SettingsStore
 from execution.broker import AlpacaBroker
 from execution.factory import BrokerRegistry
 from execution.ibkr_broker import IBKRBroker
@@ -170,3 +173,74 @@ def test_status_masks_ibkr_account(client):
     client.post("/config", json={"broker": "ibkr"})
     conn = client.get("/status").json()["connection"]
     assert conn["account"] == "DU****567" and conn["accounts"] == ["DU****567"]
+
+
+# ---- issue #5: validación estricta de /config y del store ---------------------
+@pytest.mark.parametrize("body", [
+    {"timeframe": "2Weeks"},
+    {"symbols": []},
+    {"symbols": ["", "AAPL"]},
+    {"symbols": ["AAPL; DROP"]},
+    {"symbols": "AAPL"},
+    {"strategy_params": {"ema_fast": -5}},
+    {"strategy_params": {"ema_slow": "abc"}},
+    {"strategy_params": {"nuevo": 1}},
+    {"strategy_params": {"ema_fast": 30, "ema_slow": 20}},
+    {"strategy_params": {"rsi_oversold": 80, "rsi_overbought": 70}},
+    {"strategy_params": {"rsi_overbought": 150}},
+    {"lookback_days": 100000},
+    {"lookback_days": 0},
+    {"loop_interval_sec": 1},
+    {"risk_pct": 11},
+    {"foo": 1},
+    {"bot_enabled": True},          # se cambia con /toggle-bot
+])
+def test_invalid_config_is_rejected(client, body):
+    before = client.get("/config").json()
+    r = client.post("/config", json=body)
+    assert r.status_code == 422, r.text
+    assert client.get("/config").json() == before
+
+
+def test_symbols_are_normalized(client):
+    r = client.post("/config", json={"symbols": [" aapl", "MSFT", "AAPL", "btc/usd"]})
+    assert r.status_code == 200
+    assert r.json()["symbols"] == ["AAPL", "MSFT", "BTC/USD"]
+
+
+def test_partial_strategy_params_merge(client):
+    r = client.post("/config", json={"strategy_params": {"ema_fast": 8}}).json()
+    assert r["strategy_params"]["ema_fast"] == 8 and r["strategy_params"]["ema_slow"] == 26
+
+
+def test_unknown_strategy_keys_in_db_are_dropped(tmp_path):
+    store = SettingsStore(tmp_path / "s.db")
+    with store._conn() as conn:  # BD "contaminada" por la versión anterior
+        conn.execute("UPDATE settings SET value=? WHERE key='strategy_params'",
+                     (json.dumps({**store.get("strategy_params"), "nuevo": 1}),))
+    params = store.update({"strategy_params": {"ema_fast": 10}})["strategy_params"]
+    assert "nuevo" not in params and params["ema_fast"] == 10
+
+
+@pytest.mark.parametrize("changes", [
+    {"timeframe": "2Weeks"}, {"symbols": []}, {"lookback_days": 100000},
+    {"strategy_params": {"ema_slow": "abc"}}, {"strategy_params": {"ema_fast": 50}},
+    {"bot_enabled": "yes"},
+])
+def test_store_validates_too(tmp_path, changes):
+    """El optimizador y el bot escriben directamente en el store: también valida."""
+    with pytest.raises(ValueError):
+        SettingsStore(tmp_path / "s.db").update(changes)
+
+
+def test_api_timeframes_match_settings():
+    field = api_main.ConfigUpdate.model_fields["timeframe"]
+    assert set(field.annotation.__args__[0].__args__) == set(TIMEFRAMES)
+
+
+def test_unknown_keys_rejected_in_toggle(client):
+    assert client.post("/toggle-bot", json={"enable": True}).status_code == 422
+
+
+def test_openapi_still_builds(client):
+    assert TestClient(api_main.app).get("/openapi.json").status_code == 200

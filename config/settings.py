@@ -8,13 +8,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
 from core.env import load_env
+from data.base import TIMEFRAMES
 
 load_env()  # antes de leer SETTINGS_DB_PATH, CONFIRM_LIVE_TRADING, etc.
 
@@ -50,9 +54,70 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
 }
 
+# Límites compartidos por la API, el dashboard y el store.
+RISK_PCT_MIN, RISK_PCT_MAX = 0.0, 10.0     # risk_pct en (0, 10]
+LOOKBACK_DAYS_MAX = 3650
+LOOP_INTERVAL_MIN, LOOP_INTERVAL_MAX = 5, 86_400
+# Acciones (AAPL, BRK.B, BRK-B) o cripto (BTC/USD)
+SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,10}([./-][A-Z0-9]{1,10})?$")
+
 VALID_MODES = {"paper", "live"}
 VALID_BROKERS = {"alpaca", "ibkr"}
 VALID_DATA_PROVIDERS = {"auto", *VALID_BROKERS}
+
+
+class StrategyParams(BaseModel):
+    """Parámetros de la estrategia EMA/RSI/ATR/Bollinger (todas las claves conocidas)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ema_fast: int = Field(ge=1, le=500)
+    ema_slow: int = Field(ge=2, le=1000)
+    rsi_period: int = Field(ge=2, le=200)
+    rsi_overbought: float = Field(gt=0, lt=100)
+    rsi_oversold: float = Field(gt=0, lt=100)
+    atr_period: int = Field(ge=1, le=200)
+    atr_stop_mult: float = Field(gt=0, le=20)
+    bb_period: int = Field(ge=2, le=500)
+    bb_std: float = Field(gt=0, le=10)
+
+    def check(self) -> StrategyParams:
+        if self.ema_fast >= self.ema_slow:
+            raise ValueError("strategy_params: ema_fast debe ser menor que ema_slow")
+        if self.rsi_oversold >= self.rsi_overbought:
+            raise ValueError("strategy_params: rsi_oversold debe ser menor que rsi_overbought")
+        return self
+
+
+STRATEGY_KEYS = tuple(StrategyParams.model_fields)
+
+
+def validate_strategy_params(params: dict[str, Any]) -> dict[str, Any]:
+    """Valida el conjunto completo de parámetros y devuelve los valores normalizados."""
+    try:
+        model = StrategyParams(**params)
+    except ValidationError as exc:
+        errs = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
+        raise ValueError(f"strategy_params inválido: {errs}") from None
+    return model.check().model_dump()
+
+
+def normalize_symbols(symbols: Any) -> list[str]:
+    """Lista no vacía, sin cadenas vacías, en mayúsculas y sin duplicados (conserva el orden)."""
+    if isinstance(symbols, str) or not isinstance(symbols, list | tuple):
+        raise ValueError("symbols debe ser una lista")
+    out: list[str] = []
+    for raw in symbols:
+        sym = str(raw).strip().upper()
+        if not sym:
+            raise ValueError("symbols no puede contener cadenas vacías")
+        if not SYMBOL_RE.match(sym):
+            raise ValueError(f"Símbolo inválido: {raw!r}")
+        if sym not in out:
+            out.append(sym)
+    if not out:
+        raise ValueError("symbols no puede estar vacío")
+    return out
 
 
 class LiveTradingNotConfirmed(PermissionError):
@@ -143,12 +208,32 @@ class SettingsStore:
             changes["data_provider"] = provider
         if "risk_pct" in changes:
             risk = float(changes["risk_pct"])
-            if not 0 < risk <= 10:
-                raise ValueError("risk_pct debe estar entre 0 y 10")
+            if not RISK_PCT_MIN < risk <= RISK_PCT_MAX:
+                raise ValueError(f"risk_pct debe estar entre {RISK_PCT_MIN:g} (excluido) y {RISK_PCT_MAX:g}")
             changes["risk_pct"] = risk
         if "strategy_params" in changes:
-            merged = {**self.get("strategy_params", {}), **changes["strategy_params"]}
-            changes["strategy_params"] = merged
+            if not isinstance(changes["strategy_params"], dict):
+                raise ValueError("strategy_params debe ser un objeto")
+            unknown_params = set(changes["strategy_params"]) - set(STRATEGY_KEYS)
+            if unknown_params:
+                raise ValueError(f"strategy_params: claves desconocidas {sorted(unknown_params)}")
+            # Base = valores por defecto + actuales (descarta claves antiguas desconocidas).
+            current = {k: v for k, v in self.get("strategy_params", {}).items() if k in STRATEGY_KEYS}
+            merged = {**DEFAULT_SETTINGS["strategy_params"], **current, **changes["strategy_params"]}
+            changes["strategy_params"] = validate_strategy_params(merged)
+        if "symbols" in changes:
+            changes["symbols"] = normalize_symbols(changes["symbols"])
+        if "timeframe" in changes and changes["timeframe"] not in TIMEFRAMES:
+            raise ValueError(f"timeframe inválido: {changes['timeframe']} "
+                             f"(admitidos: {', '.join(TIMEFRAMES)})")
+        for key, lo, hi in (("lookback_days", 1, LOOKBACK_DAYS_MAX),
+                            ("loop_interval_sec", LOOP_INTERVAL_MIN, LOOP_INTERVAL_MAX)):
+            if key in changes:
+                value = changes[key]
+                if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
+                    raise ValueError(f"{key} debe ser un entero entre {lo} y {hi}")
+        if "bot_enabled" in changes and not isinstance(changes["bot_enabled"], bool):
+            raise ValueError("bot_enabled debe ser true/false")
         unknown = set(changes) - set(DEFAULT_SETTINGS)
         if unknown:
             raise ValueError(f"Claves desconocidas: {sorted(unknown)}")

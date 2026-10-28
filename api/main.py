@@ -5,13 +5,22 @@ import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from config.settings import LiveTradingNotConfirmed, SettingsStore, resolve_data_provider
+from config.settings import (
+    LOOKBACK_DAYS_MAX,
+    LOOP_INTERVAL_MAX,
+    LOOP_INTERVAL_MIN,
+    RISK_PCT_MAX,
+    LiveTradingNotConfirmed,
+    SettingsStore,
+    normalize_symbols,
+    resolve_data_provider,
+)
 from execution.base import BaseBroker, BrokerConnectionError
 from execution.factory import BrokerRegistry
 
@@ -122,26 +131,55 @@ def broker_call(fn, *args, action: str = "la operación"):
         raise HTTPException(status_code=502, detail=f"El broker rechazó {action}: {exc}") from exc
 
 
-class ConfigUpdate(BaseModel):
-    mode: str | None = Field(None, pattern="^(paper|live)$")
-    broker: str | None = Field(None, pattern="^(alpaca|ibkr)$")
-    data_provider: str | None = Field(None, pattern="^(auto|alpaca|ibkr)$")
-    symbols: list[str] | None = None
-    risk_pct: float | None = Field(None, gt=0, le=10)
-    timeframe: str | None = None
-    loop_interval_sec: int | None = Field(None, ge=5)
-    lookback_days: int | None = Field(None, ge=1)
-    strategy_params: dict[str, Any] | None = None
+class StrictModel(BaseModel):
+    """Las claves desconocidas dan 422 en lugar de ignorarse en silencio."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class StrategyParamsUpdate(StrictModel):
+    """Cambios parciales de strategy_params (mismos límites que ``StrategyParams``).
+
+    Las reglas cruzadas (ema_fast < ema_slow, rsi_oversold < rsi_overbought) se validan en
+    el store tras fusionar con los valores actuales.
+    """
+
+    ema_fast: int | None = Field(None, ge=1, le=500)
+    ema_slow: int | None = Field(None, ge=2, le=1000)
+    rsi_period: int | None = Field(None, ge=2, le=200)
+    rsi_overbought: float | None = Field(None, gt=0, lt=100)
+    rsi_oversold: float | None = Field(None, gt=0, lt=100)
+    atr_period: int | None = Field(None, ge=1, le=200)
+    atr_stop_mult: float | None = Field(None, gt=0, le=20)
+    bb_period: int | None = Field(None, ge=2, le=500)
+    bb_std: float | None = Field(None, gt=0, le=10)
+
+
+class ConfigUpdate(StrictModel):
+    mode: Literal["paper", "live"] | None = None
+    broker: Literal["alpaca", "ibkr"] | None = None
+    data_provider: Literal["auto", "alpaca", "ibkr"] | None = None
+    symbols: list[str] | None = Field(None, min_length=1, max_length=100)
+    risk_pct: float | None = Field(None, gt=0, le=RISK_PCT_MAX)
+    timeframe: Literal["1Min", "5Min", "15Min", "1Hour", "1Day"] | None = None
+    loop_interval_sec: int | None = Field(None, ge=LOOP_INTERVAL_MIN, le=LOOP_INTERVAL_MAX)
+    lookback_days: int | None = Field(None, ge=1, le=LOOKBACK_DAYS_MAX)
+    strategy_params: StrategyParamsUpdate | None = None
     # Confirmación explícita para cambiar de broker estando (o pasando) a live.
     confirm_live: bool = False
 
+    @field_validator("symbols")
+    @classmethod
+    def _symbols(cls, v: list[str] | None) -> list[str] | None:
+        return None if v is None else normalize_symbols(v)
 
-class ToggleRequest(BaseModel):
+
+class ToggleRequest(StrictModel):
     enabled: bool | None = None          # None = alternar
     close_positions: bool = False        # kill switch total: liquida todo
 
 
-class ClosePositionRequest(BaseModel):
+class ClosePositionRequest(StrictModel):
     symbol: str
 
 
