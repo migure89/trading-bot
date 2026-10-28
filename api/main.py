@@ -7,7 +7,6 @@ import secrets
 from contextlib import asynccontextmanager
 from typing import Any
 
-from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -16,7 +15,6 @@ from config.settings import LiveTradingNotConfirmed, SettingsStore, resolve_data
 from execution.base import BaseBroker, BrokerConnectionError
 from execution.factory import BrokerRegistry
 
-load_dotenv()
 log = logging.getLogger("api")
 
 # Rutas públicas (sin token): healthcheck de Docker/balanceadores.

@@ -55,6 +55,11 @@ API **FastAPI**, dashboard **Streamlit** y monitorización con logs JSON + **Pro
 > **y** pon `CONFIRM_LIVE_TRADING=true`. Sin esa variable, la API devuelve 403 y el bot no opera en real.
 > La misma regla se aplica a Interactive Brokers (ver sección 9).
 
+> **Fuera de Docker** el `.env` se carga automáticamente al importar la plataforma (`core/env.py`),
+> desde el directorio actual o la raíz del proyecto, antes de leer `SETTINGS_DB_PATH`, `LOG_LEVEL`
+> o `LOG_FILE`. Las variables ya exportadas en la shell tienen prioridad; `ENV_FILE=/ruta/.env`
+> permite usar otro fichero.
+
 ## 2. Despliegue con Docker (recomendado)
 
 ```bash

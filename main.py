@@ -10,8 +10,6 @@ import argparse
 import signal
 import time
 
-from dotenv import load_dotenv
-
 from config.settings import LiveTradingNotConfirmed, SettingsStore, resolve_data_provider
 from core.registry import resolve
 from data.base import is_crypto
@@ -116,7 +114,6 @@ class TradingBot:
 
 
 def main() -> None:
-    load_dotenv()
     ap = argparse.ArgumentParser(description="Bot de trading cuantitativo (Alpaca / Interactive Brokers)")
     ap.add_argument("--once", action="store_true", help="ejecuta una sola iteración")
     ap.add_argument("--no-metrics", action="store_true", help="no arranca el exporter Prometheus")

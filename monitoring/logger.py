@@ -7,6 +7,10 @@ import os
 import sys
 from datetime import UTC, datetime
 
+from core.env import load_env
+
+load_env()  # LOG_LEVEL y LOG_FILE pueden venir del .env
+
 _RESERVED = set(vars(logging.LogRecord("", 0, "", 0, "", (), None))) | {"message", "asctime"}
 
 
@@ -24,6 +28,13 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str, ensure_ascii=False)
 
 
+def log_level() -> int:
+    """Nivel de LOG_LEVEL (nombre o número); INFO si no es válido."""
+    value = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    level = int(value) if value.isdigit() else logging.getLevelName(value)
+    return level if isinstance(level, int) else logging.INFO
+
+
 def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:
@@ -35,6 +46,6 @@ def get_logger(name: str) -> logging.Logger:
             fh = logging.FileHandler(log_file)
             fh.setFormatter(JsonFormatter())
             logger.addHandler(fh)
-        logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+        logger.setLevel(log_level())
         logger.propagate = False
     return logger

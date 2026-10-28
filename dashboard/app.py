@@ -13,6 +13,14 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from dotenv import load_dotenv
+
+# Mismo criterio que core/env.py (el dashboard se lanza con `streamlit run` y puede no tener
+# la raíz del proyecto en sys.path): .env del directorio actual y de la raíz, sin pisar el entorno.
+if os.getenv("SKIP_DOTENV", "").lower() not in {"1", "true", "yes"}:
+    for _env in (os.getenv("ENV_FILE"), ".env", os.path.join(os.path.dirname(__file__), "..", ".env")):
+        if _env and os.path.isfile(_env):
+            load_dotenv(_env, override=False)
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 # Mismo token que la API (API_TOKEN); se envía en cada petición si está definido.

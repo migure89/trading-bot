@@ -98,12 +98,9 @@ def run_feedback_loop(store: SettingsStore, provider, n_trials: int = 50,
 
 
 def main() -> None:
-    from dotenv import load_dotenv
-
     from config.settings import resolve_data_provider
     from data.factory import DataProviderRegistry
 
-    load_dotenv()
     ap = argparse.ArgumentParser(description="Reoptimiza la estrategia con Optuna")
     ap.add_argument("--trials", type=int, default=50)
     ap.add_argument("--no-apply", action="store_true", help="solo informa, no guarda en la BD")

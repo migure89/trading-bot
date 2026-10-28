@@ -1,5 +1,11 @@
 """Fixtures comunes: datos sintéticos y mocks de Alpaca (sin credenciales)."""
+# ruff: noqa: E402
 from __future__ import annotations
+
+import os
+
+# Los tests no deben depender del .env local del desarrollador (claves, API_TOKEN, rutas…).
+os.environ["SKIP_DOTENV"] = "1"
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock

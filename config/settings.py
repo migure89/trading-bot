@@ -14,9 +14,18 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from core.env import load_env
+
+load_env()  # antes de leer SETTINGS_DB_PATH, CONFIRM_LIVE_TRADING, etc.
+
 BASE_DIR = Path(__file__).resolve().parent
 SCHEMA_PATH = BASE_DIR / "schema.sql"
-DEFAULT_DB_PATH = Path(os.getenv("SETTINGS_DB_PATH", BASE_DIR / "settings.db"))
+DEFAULT_DB_PATH = BASE_DIR / "settings.db"
+
+
+def default_db_path() -> Path:
+    """Ruta de la BD resuelta al crear el store (no al importar): respeta SETTINGS_DB_PATH."""
+    return Path(os.getenv("SETTINGS_DB_PATH") or DEFAULT_DB_PATH)
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "mode": "paper",              # paper | live
@@ -64,7 +73,7 @@ class SettingsStore:
     """Acceso thread-safe a la configuración persistida en SQLite."""
 
     def __init__(self, db_path: str | Path | None = None) -> None:
-        self.db_path = Path(db_path or DEFAULT_DB_PATH)
+        self.db_path = Path(db_path or default_db_path())
         self._lock = threading.Lock()
         self.init_db()
 
