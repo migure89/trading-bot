@@ -19,7 +19,12 @@ ORDERS = Counter("bot_orders_total", "Órdenes enviadas", ["symbol", "side"])
 ERRORS = Counter("bot_errors_total", "Errores en el bucle principal")
 ITERATIONS = Counter("bot_iterations_total", "Iteraciones del bucle principal")
 LAST_SUCCESS = Gauge("bot_last_success_timestamp_seconds",
-                     "Momento (epoch) de la última iteración correcta (incluye las de pausa)")
+                     "Momento (epoch) de la última iteración de trading correcta (no avanza en pausa)")
+LAST_ITERATION = Gauge("bot_last_iteration_timestamp_seconds",
+                       "Momento (epoch) de la última iteración, en pausa o activo (cuelgues)")
+LAST_HEALTHCHECK = Gauge("bot_last_healthcheck_timestamp_seconds",
+                         "Momento (epoch) del último health-check correcto en pausa")
+PAUSED = Gauge("bot_paused", "1 si el bot está en pausa (kill switch)")
 INFO = Gauge("bot_info", "Broker y modo configurados (valor siempre 1)", ["broker", "mode"])
 
 
@@ -31,6 +36,7 @@ def start_exporter(port: int | None = None, addr: str | None = None) -> None:
 def update_config(cfg: dict) -> None:
     """Al principio de cada iteración: estado deseado según la configuración (aunque el broker falle)."""
     BOT_ENABLED.set(int(bool(cfg.get("bot_enabled"))))
+    PAUSED.set(int(not cfg.get("bot_enabled")))
     LIVE_MODE.set(int(cfg.get("mode") == "live"))
     INFO.clear()
     INFO.labels(cfg.get("broker", ""), cfg.get("mode", "")).set(1)

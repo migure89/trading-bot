@@ -172,7 +172,7 @@ class ExplodingBroker:
 
 def test_paused_bot_does_not_touch_broker(store, provider, caplog):
     broker = ExplodingBroker()
-    bot = TradingBot(store, provider, broker)
+    bot = TradingBot(store, provider, broker, healthcheck_interval=0)   # health-check desactivado
     store.update({"broker": "ibkr"})
     with caplog.at_level("INFO", logger="bot"):
         for _ in range(3):
@@ -230,3 +230,104 @@ def test_alpaca_without_keys_single_clear_error(store, provider, monkeypatch, ca
     assert len(errors) == 1 and errors[0].exc_info is None
     assert "APCA_API_KEY_ID" in errors[0].error
     assert _metric("bot_broker_connected", broker="alpaca") == 0
+
+
+# ---- #17: health-check de solo lectura en pausa ---------------------------
+class FakeClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class ReadOnlyBroker:
+    """Broker sano que falla si se llama a cualquier método que opere."""
+    name = "alpaca"
+
+    def __init__(self, equity=12345.0, error=None):
+        self.reads, self.equity, self.error = 0, equity, error
+
+    def ensure_mode(self, mode):
+        self.reads += 1
+        if self.error:
+            raise ValueError(self.error)
+
+    def account(self):
+        return {"equity": self.equity, "daily_pnl": 7.0}
+
+    def positions(self):
+        return [{"symbol": "AAPL"}]
+
+    def _forbidden(self, *a, **k):
+        raise AssertionError("en pausa no se puede operar")
+
+    market_order = close_position = close_all = cancel_all_orders = _forbidden
+
+
+def test_paused_healthcheck_reports_broker_and_equity(store, provider, monkeypatch):
+    import main
+    monkeypatch.setattr(main.TradingBot, "process_symbol",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("process_symbol en pausa")))
+    clock, broker = FakeClock(), ReadOnlyBroker()
+    bot = TradingBot(store, provider, broker, healthcheck_interval=300, clock=clock)
+    main.exporter.LAST_SUCCESS.set(0)
+    out = bot.iteration()
+    assert out == {"status": "paused", "broker": "alpaca", "healthcheck": "ok"}
+    assert _metric("bot_broker_connected", broker="alpaca") == 1
+    assert _metric("bot_equity_usd") == 12345.0 and _metric("bot_open_positions") == 1
+    assert _metric("bot_paused") == 1 and _metric("bot_last_healthcheck_timestamp_seconds") > 0
+    assert _metric("bot_last_iteration_timestamp_seconds") > 0
+    assert _metric("bot_last_success_timestamp_seconds") == 0      # en pausa no avanza
+
+
+def test_paused_healthcheck_low_frequency(store, provider):
+    clock, broker = FakeClock(), ReadOnlyBroker()
+    bot = TradingBot(store, provider, broker, healthcheck_interval=300, clock=clock)
+    for _ in range(5):                       # iteraciones seguidas: solo el primer health-check
+        bot.iteration()
+    assert broker.reads == 1
+    clock.t += 299
+    assert "healthcheck" not in bot.iteration() and broker.reads == 1
+    clock.t += 1
+    assert bot.iteration()["healthcheck"] == "ok" and broker.reads == 2
+
+
+def test_paused_healthcheck_failure_single_warning(store, provider, caplog):
+    clock, broker = FakeClock(), ReadOnlyBroker(error="Gateway caído")
+    bot = TradingBot(store, provider, broker, healthcheck_interval=60, clock=clock)
+    with caplog.at_level("DEBUG", logger="bot"):
+        for _ in range(4):
+            assert bot.iteration()["healthcheck"] == "broker_unavailable"
+            clock.t += 60
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and not any(r.levelname == "ERROR" for r in caplog.records)
+    assert not any(r.exc_info for r in caplog.records)
+    assert _metric("bot_broker_connected", broker="alpaca") == 0
+    assert bot.next_delay(60) == 60          # en pausa sin backoff: reacciona rápido al reanudar
+
+
+def test_paused_healthcheck_env(monkeypatch, store, provider):
+    import main
+    monkeypatch.setenv("PAUSED_HEALTHCHECK_SECONDS", "0")
+    assert main.paused_healthcheck_seconds() == 0
+    broker = ReadOnlyBroker()
+    TradingBot(store, provider, broker).iteration()
+    assert broker.reads == 0
+    monkeypatch.setenv("PAUSED_HEALTHCHECK_SECONDS", "abc")
+    assert main.paused_healthcheck_seconds() == main.PAUSED_HEALTHCHECK_DEFAULT_SEC
+    monkeypatch.delenv("PAUSED_HEALTHCHECK_SECONDS")
+    assert main.paused_healthcheck_seconds() == 300
+
+
+def test_last_success_advances_only_when_active(store, provider, fake_trading_client, monkeypatch):
+    import main
+    monkeypatch.setattr(main, "latest_action", lambda df, p: "hold")
+    broker, _ = make_broker(fake_trading_client)
+    bot = TradingBot(store, provider, broker, healthcheck_interval=0)
+    main.exporter.LAST_SUCCESS.set(0)
+    bot.iteration()
+    assert _metric("bot_last_success_timestamp_seconds") == 0
+    store.update({"bot_enabled": True, "symbols": ["AAPL"]})
+    assert bot.iteration()["status"] == "ok"
+    assert _metric("bot_last_success_timestamp_seconds") > 0 and _metric("bot_paused") == 0

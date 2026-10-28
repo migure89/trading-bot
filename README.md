@@ -192,11 +192,18 @@ Todas las rutas salvo `/health` exigen `API_TOKEN` si está definido (sección 2
 | `bot_enabled`, `bot_live_mode` | Estado configurado; se actualiza al principio de cada iteración aunque el broker falle |
 | `bot_info{broker,mode}` | Broker y modo configurados (valor 1) |
 | `bot_broker_connected{broker}` | 1 si el broker activo responde, 0 ante cualquier fallo (incluida la falta de credenciales) |
-| `bot_last_success_timestamp_seconds` | Última iteración correcta (también las de pausa) |
-| `bot_equity_usd`, `bot_daily_pnl_usd`, `bot_open_positions` | Cuenta del broker (solo se refrescan con el bot activo) |
+| `bot_paused` | 1 si el bot está en pausa (kill switch) |
+| `bot_last_iteration_timestamp_seconds` | Última iteración del bucle, en pausa o activo (sirve para detectar cuelgues) |
+| `bot_last_success_timestamp_seconds` | Última iteración de trading correcta; **no avanza en pausa** |
+| `bot_last_healthcheck_timestamp_seconds` | Último health-check correcto con el bot en pausa |
+| `bot_equity_usd`, `bot_daily_pnl_usd`, `bot_open_positions` | Cuenta del broker (en cada iteración activa y en cada health-check en pausa) |
 | `bot_orders_total`, `bot_errors_total`, `bot_iterations_total` | Contadores |
 
-Con el bot **en pausa** no se conecta al broker. Si el broker falla, el bot reintenta con backoff
+Con el bot **en pausa** no se opera: solo se hace un **health-check de solo lectura** (modo, cuenta y
+posiciones; nunca órdenes ni cancelaciones) cada `PAUSED_HEALTHCHECK_SECONDS` segundos (por defecto
+300; `0` lo desactiva), que actualiza `bot_broker_connected`, la equity y las posiciones. Si falla en
+pausa, escribe un único WARNING (sin traceback) y pone `bot_broker_connected` a 0. Si el broker falla
+con el bot activo, el bot reintenta con backoff
 exponencial (`loop_interval_sec` × 2ⁿ, máximo 5 min) y solo escribe un ERROR cuando cambia el error;
 al recuperarse escribe `broker reconectado`.
 
@@ -212,7 +219,7 @@ groups:
   - name: trading-bot
     rules:
       - alert: BotColgado
-        expr: time() - bot_last_success_timestamp_seconds > 600
+        expr: time() - bot_last_iteration_timestamp_seconds > 600
         for: 5m
         labels: {severity: critical}
         annotations: {summary: "El bot no completa una iteración desde hace más de 10 min"}
@@ -221,6 +228,16 @@ groups:
         for: 5m
         labels: {severity: critical}
         annotations: {summary: "Bot activo pero el broker no responde"}
+      - alert: BrokerDesconectadoEnPausa
+        expr: bot_paused == 1 and on() max(bot_broker_connected) == 0
+        for: 15m
+        labels: {severity: warning}
+        annotations: {summary: "Bot en pausa y el health-check no llega al broker"}
+      - alert: BotSinOperar
+        expr: bot_enabled == 1 and time() - bot_last_success_timestamp_seconds > 900
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "Bot activo sin una iteración de trading correcta en 15 min"}
 ```
 
 ## 8. Gestión del proyecto

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import time
 
@@ -25,13 +26,30 @@ from strategies.indicators import atr
 log = get_logger("bot")
 
 BACKOFF_MAX_SEC = 300  # tope del backoff exponencial ante fallos del broker
+PAUSED_HEALTHCHECK_DEFAULT_SEC = 300  # health-check de solo lectura con el bot en pausa (0 = desactivado)
+
+
+def paused_healthcheck_seconds() -> int:
+    """Intervalo del health-check en pausa (``PAUSED_HEALTHCHECK_SECONDS``; 0 lo desactiva)."""
+    raw = os.getenv("PAUSED_HEALTHCHECK_SECONDS", "").strip()
+    try:
+        return max(0, int(raw)) if raw else PAUSED_HEALTHCHECK_DEFAULT_SEC
+    except ValueError:
+        log.warning("PAUSED_HEALTHCHECK_SECONDS inválido; se usa el valor por defecto",
+                    extra={"value": raw, "default": PAUSED_HEALTHCHECK_DEFAULT_SEC})
+        return PAUSED_HEALTHCHECK_DEFAULT_SEC
 
 
 class TradingBot:
     """``provider`` y ``broker`` pueden ser una instancia fija o un registro (selección en caliente)."""
 
-    def __init__(self, store: SettingsStore, provider, broker) -> None:
+    def __init__(self, store: SettingsStore, provider, broker,
+                 healthcheck_interval: int | None = None, clock=time.monotonic) -> None:
         self.store, self.provider, self.broker = store, provider, broker
+        self.healthcheck_interval = (paused_healthcheck_seconds() if healthcheck_interval is None
+                                     else max(0, int(healthcheck_interval)))
+        self._clock = clock
+        self._last_healthcheck: float | None = None  # monotonic del último health-check en pausa
         self.running = True
         self._paused: bool | None = None           # para registrar la pausa solo al cambiar
         self._failures = 0                          # fallos consecutivos del broker (backoff)
@@ -95,17 +113,21 @@ class TradingBot:
     def iteration(self) -> dict:
         cfg = self.store.load()  # hot-reload
         exporter.ITERATIONS.inc()
-        exporter.update_config(cfg)          # bot_enabled / bot_live_mode / bot_info, pase lo que pase
+        exporter.LAST_ITERATION.set_to_current_time()
+        exporter.update_config(cfg)          # bot_enabled / bot_live_mode / bot_info / bot_paused
         if not cfg["bot_enabled"]:
-            # En pausa no se toca el broker (ni conexiones ni llamadas de trading).
+            # En pausa no se opera: como mucho un health-check de solo lectura a baja frecuencia.
             if self._paused is not True:
                 log.info("bot en pausa (kill switch)", extra={"mode": cfg["mode"], "broker": cfg["broker"]})
             self._paused = True
-            exporter.LAST_SUCCESS.set_to_current_time()
-            return {"status": "paused", "broker": cfg["broker"]}
+            out = {"status": "paused", "broker": cfg["broker"]}
+            if self._healthcheck_due():
+                out["healthcheck"] = self.paused_healthcheck(cfg)
+            return out
         if self._paused:
             log.info("bot reanudado", extra={"mode": cfg["mode"], "broker": cfg["broker"]})
         self._paused = False
+        self._last_healthcheck = None
 
         broker, provider = self.active(cfg)
         try:
@@ -131,14 +153,42 @@ class TradingBot:
         exporter.LAST_SUCCESS.set_to_current_time()
         return {"status": "ok", "broker": broker.name, "actions": actions}
 
+    def _healthcheck_due(self) -> bool:
+        if not self.healthcheck_interval:
+            return False
+        now = self._clock()
+        if self._last_healthcheck is not None and now - self._last_healthcheck < self.healthcheck_interval:
+            return False
+        self._last_healthcheck = now
+        return True
+
+    def paused_healthcheck(self, cfg: dict) -> str:
+        """Solo lectura: modo, cuenta y posiciones para el exporter. Nunca opera ni cancela."""
+        broker = resolve(self.broker, cfg["broker"])
+        try:
+            broker.ensure_mode(cfg["mode"])
+            account = broker.account()
+            positions = broker.positions()
+        except Exception as exc:  # noqa: BLE001 - incluye LiveTradingNotConfirmed y fallos de red/claves
+            self._broker_failed(broker.name, str(exc) or type(exc).__name__, paused=True)
+            return "broker_unavailable"
+        self._broker_ok(broker.name)
+        exporter.update_account(account, len(positions))
+        exporter.LAST_HEALTHCHECK.set_to_current_time()
+        return "ok"
+
     # ---- estado de conexión: deduplicación de logs y backoff --------------
-    def _broker_failed(self, name: str, error: str) -> None:
+    def _broker_failed(self, name: str, error: str, paused: bool = False) -> None:
         exporter.set_broker_connected(name, False, self._last_broker)
         exporter.ERRORS.inc()
         self._failures += 1
         key = (name, error)
-        if key != self._last_error:          # primer fallo o error distinto: un único ERROR
-            log.error("broker no disponible", extra={"broker": name, "error": error})
+        if key != self._last_error:          # primer fallo o error distinto: un único ERROR/WARNING
+            if paused:                       # en pausa no es crítico: sin traceback y como WARNING
+                log.warning("broker no disponible (health-check en pausa)",
+                            extra={"broker": name, "error": error})
+            else:
+                log.error("broker no disponible", extra={"broker": name, "error": error})
         else:
             log.debug("broker sigue sin responder", extra={"broker": name, "failures": self._failures})
         self._last_error, self._last_broker = key, name
@@ -150,8 +200,12 @@ class TradingBot:
         self._failures, self._last_error, self._last_broker = 0, None, name
 
     def next_delay(self, interval: int) -> int:
-        """Espera hasta la siguiente iteración: backoff exponencial (máx. 5 min) si el broker falla."""
-        if not self._failures:
+        """Espera hasta la siguiente iteración: backoff exponencial (máx. 5 min) si el broker falla.
+
+        En pausa no hay backoff: el health-check ya limita las llamadas al broker y así el bot
+        reacciona en ``interval`` segundos cuando se reanuda.
+        """
+        if not self._failures or self._paused:
             return interval
         return int(min(max(interval, 5) * 2 ** (self._failures - 1), max(BACKOFF_MAX_SEC, interval)))
 
