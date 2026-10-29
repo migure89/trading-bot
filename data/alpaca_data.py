@@ -20,7 +20,23 @@ from monitoring.logger import get_logger
 
 log = get_logger("data.alpaca")
 
-__all__ = ["AlpacaDataProvider", "is_crypto", "normalize_bars"]
+__all__ = ["ADJUSTMENTS", "AlpacaDataProvider", "is_crypto", "normalize_bars"]
+
+# Ajuste de precios de acciones (alpaca-py ``Adjustment``). Por defecto "all" (splits + dividendos):
+# sin ajuste un split aparece como un desplome (p.ej. NVDA -90 % el 2024-06-10) y rompe señales y backtests.
+ADJUSTMENTS = ("raw", "split", "dividend", "all")
+DEFAULT_ADJUSTMENT = "all"
+
+
+def adjustment_from_env() -> str:
+    """``ALPACA_ADJUSTMENT`` (raw | split | dividend | all); valor inválido -> "all" con WARNING."""
+    raw = os.getenv("ALPACA_ADJUSTMENT", "").strip().lower()
+    if not raw:
+        return DEFAULT_ADJUSTMENT
+    if raw not in ADJUSTMENTS:
+        log.warning("ALPACA_ADJUSTMENT inválido; se usa 'all'", extra={"value": raw})
+        return DEFAULT_ADJUSTMENT
+    return raw
 
 TIMEFRAME_MAP = {
     "1Min": (1, "Minute"),
@@ -46,7 +62,7 @@ class AlpacaDataProvider:
 
     def __init__(self, api_key: str | None = None, secret_key: str | None = None,
                  stock_client=None, crypto_client=None, calendar_client=None,
-                 regular_hours_only: bool | None = None) -> None:
+                 regular_hours_only: bool | None = None, adjustment: str | None = None) -> None:
         self.api_key = api_key or os.getenv("APCA_API_KEY_ID")
         self.secret_key = secret_key or os.getenv("APCA_API_SECRET_KEY")
         self._stock = stock_client
@@ -56,6 +72,10 @@ class AlpacaDataProvider:
         self.regular_hours_only = (env_bool("ALPACA_REGULAR_HOURS_ONLY", True)
                                    if regular_hours_only is None else bool(regular_hours_only))
         self._calendar_warned = False
+        adjustment = adjustment_from_env() if adjustment is None else str(adjustment).lower()
+        if adjustment not in ADJUSTMENTS:
+            raise ValueError(f"adjustment inválido: {adjustment} (admitidos: {', '.join(ADJUSTMENTS)})")
+        self.adjustment = adjustment
 
     @property
     def stock_client(self):
@@ -116,6 +136,7 @@ class AlpacaDataProvider:
 
         En acciones intradía, por defecto solo la sesión regular (``regular_hours``/
         ``ALPACA_REGULAR_HOURS_ONLY``); las barras de 1 hora se alinean a la apertura (09:30 ET).
+        Los precios de acciones se piden ajustados (``adjustment``, por defecto splits + dividendos).
         """
         end = end or datetime.now(UTC) - timedelta(minutes=16)  # evita restricción SIP
         start = end - timedelta(days=days)
@@ -126,12 +147,14 @@ class AlpacaDataProvider:
                                     start=start, end=end)
             return normalize_bars(self.crypto_client.get_crypto_bars(req).df, symbol)
 
+        from alpaca.data.enums import Adjustment
         from alpaca.data.requests import StockBarsRequest
 
         rth = self.regular_hours_only if regular_hours is None else bool(regular_hours)
         intraday = timeframe != "1Day"
         fetch_tf = "30Min" if (rth and timeframe == "1Hour") else timeframe
-        req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=_timeframe(fetch_tf), start=start, end=end)
+        req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=_timeframe(fetch_tf), start=start, end=end,
+                               adjustment=Adjustment(self.adjustment))
         df = normalize_bars(self.stock_client.get_stock_bars(req).df, symbol)
         if rth and intraday and not df.empty:
             df = regular_session_bars(df, timeframe, self.sessions(start, end))

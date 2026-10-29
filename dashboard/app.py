@@ -220,7 +220,8 @@ else:
     c3.metric("Posiciones abiertas", NA)
     c4.metric("PnL flotante", NA)
 
-tab_pos, tab_perf, tab_ai = st.tabs(["Posiciones", "Rendimiento", "Parámetros IA"])
+tab_pos, tab_perf, tab_ai, tab_shadow = st.tabs(["Posiciones", "Rendimiento", "Parámetros IA",
+                                                 "Sombra (sin órdenes)"])
 
 with tab_pos:
     if positions:
@@ -284,3 +285,39 @@ with tab_ai:
             st.plotly_chart(px.line(dfh.iloc[::-1], x="created_at", y="metrics.sharpe", color="symbol",
                                     markers=True, title="Sharpe fuera de muestra"), width="stretch")
         st.dataframe(dfh, width="stretch", hide_index=True)
+
+with tab_shadow:
+    st.caption("Estrategia en sombra: solo calcula señales y pesos objetivo una vez al día. "
+               "**Nunca envía órdenes**; la que opera sigue siendo ema_rsi.")
+    shadow, shadow_err = call_api("GET", "/shadow")
+    if shadow_err:
+        st.info(f"Sombra no disponible: {shadow_err}")
+    elif not isinstance(shadow, dict) or shadow.get("strategy", "off") == "off":
+        st.write("Estrategia en sombra desactivada (shadow_strategy=off).")
+    elif not shadow.get("latest"):
+        st.write(f"Estrategia **{shadow.get('strategy')}** en sombra: todavía sin señales "
+                 f"(se calculan cada día hábil a partir de las {shadow.get('daily_run_time')} ET).")
+    else:
+        last = shadow["latest"]
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Estrategia", last.get("strategy", "—"))
+        s2.metric("Última barra cerrada", last.get("as_of", "—"))
+        s3.metric("Régimen (SPY > SMA200)", "Alcista" if last.get("regime_bull") else "Defensivo")
+        weights = pd.DataFrame(sorted((last.get("weights") or {}).items()), columns=["symbol", "peso"])
+        if not weights.empty:
+            st.plotly_chart(px.bar(weights, x="symbol", y="peso", title="Pesos objetivo (no se operan)"),
+                            width="stretch")
+        st.write(f"Exposición objetivo: {float(last.get('gross_exposure', 0)) * 100:.1f}%")
+        changes = last.get("changes") or []
+        if changes:
+            st.subheader("Cambios respecto al día anterior")
+            st.dataframe(pd.DataFrame(changes), width="stretch", hide_index=True)
+        else:
+            st.write("Sin cambios respecto al día anterior.")
+        if last.get("errors"):
+            st.warning(f"Símbolos sin datos: {', '.join(last['errors'])}")
+        hist = shadow.get("history") or []
+        if len(hist) > 1:
+            dfs = pd.DataFrame([{"as_of": h.get("as_of"), "exposición": h.get("gross_exposure"),
+                                 "cambios": len(h.get("changes") or [])} for h in hist])
+            st.dataframe(dfs, width="stretch", hide_index=True)

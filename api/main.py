@@ -64,7 +64,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Trading Bot API", version="1.2.0", lifespan=lifespan,
+app = FastAPI(title="Trading Bot API", version="1.3.0", lifespan=lifespan,
               dependencies=[Depends(require_token)])
 
 
@@ -169,10 +169,13 @@ class ConfigUpdate(StrictModel):
     lookback_days: int | None = Field(None, ge=1, le=LOOKBACK_DAYS_MAX)
     regular_hours_only: StrictBool | None = None
     strategy_params: StrategyParamsUpdate | None = None
+    daily_run_time: str | None = Field(None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    shadow_strategy: Literal["off", "blend", "trend_sma", "rsi2"] | None = None
+    shadow_symbols: list[str] | None = Field(None, min_length=1, max_length=100)
     # Confirmación explícita para cambiar de broker estando (o pasando) a live.
     confirm_live: bool = False
 
-    @field_validator("symbols")
+    @field_validator("symbols", "shadow_symbols")
     @classmethod
     def _symbols(cls, v: list[str] | None) -> list[str] | None:
         return None if v is None else normalize_symbols(v)
@@ -279,6 +282,16 @@ def close_position(body: ClosePositionRequest, store: SettingsStore = Depends(ge
     broker = active_broker(store, brokers)
     broker_call(broker.close_position, body.symbol, action=f"el cierre de {body.symbol}")
     return {"closed": body.symbol}
+
+
+@app.get("/shadow")
+def shadow(limit: int = 30, store: SettingsStore = Depends(get_store)):
+    """Señales de la estrategia en sombra (solo lectura; la sombra nunca envía órdenes)."""
+    history = store.shadow_history(max(1, min(int(limit), 365)))
+    cfg = store.load()
+    return {"strategy": cfg.get("shadow_strategy", "off"), "symbols": cfg.get("shadow_symbols", []),
+            "daily_run_time": cfg.get("daily_run_time"), "orders": False,
+            "latest": history[0] if history else None, "history": history}
 
 
 @app.get("/metrics")

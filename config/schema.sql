@@ -29,3 +29,18 @@ CREATE TABLE IF NOT EXISTS trades (
     status      TEXT,                   -- filled | partially_filled | pending
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Migraciones de configuración ya aplicadas (una vez por BD).
+CREATE TABLE IF NOT EXISTS migrations (
+    name        TEXT PRIMARY KEY,
+    applied_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Señales y pesos objetivo de la estrategia en sombra (solo registro: nunca se envían órdenes).
+CREATE TABLE IF NOT EXISTS shadow_signals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy    TEXT NOT NULL,
+    as_of       TEXT,                   -- fecha (NY) de la última barra diaria cerrada usada
+    payload     TEXT NOT NULL,          -- JSON con pesos, cambios y régimen
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);

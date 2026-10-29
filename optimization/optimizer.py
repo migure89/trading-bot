@@ -21,6 +21,7 @@ import pandas as pd
 
 from backtesting.engine import run_backtest
 from config.settings import SettingsStore
+from core.schedule import completed_daily_bars, effective_lookback
 from monitoring.logger import get_logger, install_excepthook, setup_logging
 
 log = get_logger("optimizer")
@@ -123,6 +124,15 @@ def optimize(df: pd.DataFrame, base_params: dict, n_trials: int = 50,
             "improved": improved, "train_score": study.best_value}
 
 
+DAILY_HISTORY_DAYS = 1825   # diario: ~5 años (~1260 barras) para que el tramo OOS tenga operaciones
+
+
+def history_days(cfg: dict) -> int:
+    """Días de histórico para optimizar: 3x el lookback (mín. 60); en diario, al menos ~5 años."""
+    days = max(effective_lookback(cfg) * 3, 60)
+    return max(days, DAILY_HISTORY_DAYS) if cfg.get("timeframe") == "1Day" else days
+
+
 def run_feedback_loop(store: SettingsStore, provider, n_trials: int = 50,
                       apply: bool = True, criteria: AcceptanceCriteria | None = None) -> dict:
     """Reoptimiza cada símbolo configurado y aplica el mejor resultado *aplicable*.
@@ -137,8 +147,10 @@ def run_feedback_loop(store: SettingsStore, provider, n_trials: int = 50,
     results, errors, skipped = [], [], []
     for symbol in cfg["symbols"]:
         try:
-            df = provider.get_bars(symbol, cfg["timeframe"], days=max(cfg["lookback_days"] * 3, 60),
+            df = provider.get_bars(symbol, cfg["timeframe"], days=history_days(cfg),
                                    regular_hours=cfg.get("regular_hours_only", True))
+            if cfg["timeframe"] == "1Day":
+                df = completed_daily_bars(df)
             if len(df) < 200:
                 log.warning("datos insuficientes", extra={"symbol": symbol, "bars": len(df)})
                 skipped.append({"symbol": symbol, "bars": len(df)})
@@ -172,7 +184,11 @@ def run_feedback_loop(store: SettingsStore, provider, n_trials: int = 50,
 
 
 def apply_params(store: SettingsStore, params: dict, symbol: str, metrics: dict) -> dict:
-    """Guarda los parámetros ganadores (validados por el store) y los marca como aplicados."""
+    """Guarda los parámetros ganadores (validados por el store) y los marca como aplicados.
+
+    Solo toca ``strategy_params`` (ema_rsi). Las estrategias en sombra (trend_sma, rsi2, blend)
+    tienen parámetros fijos en código y nunca se autoaplican.
+    """
     store.update({"strategy_params": params})
     store.save_optimization(symbol, params, metrics, True)
     log.info("nuevos parámetros aplicados", extra={"symbol": symbol, "params": params})
