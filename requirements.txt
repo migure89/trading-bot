@@ -6,7 +6,7 @@ alpaca-py>=0.44,<1
 ib_async>=2.1,<3          # Interactive Brokers (TWS / IB Gateway), sucesor de ib_insync
 # Datos y cálculo
 pandas>=2.2,<4
-numpy>=1.26,<3
+numpy>=2.5.4,<3
 # Autoaprendizaje
 optuna>=4.0,<6
 # API y dashboard
