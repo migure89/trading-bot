@@ -28,7 +28,7 @@ jobs:
       APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
       SETTINGS_DB_PATH: ${{ github.workspace }}/artifacts/settings.db
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
