@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from config.settings import LiveTradingNotConfirmed, live_trading_confirmed
 from connectors.ibkr import IBKRConnection, get_shared_connection
 from data.base import is_crypto
-from execution.base import BaseBroker
+from execution.base import CANCELED, FILLED, PARTIAL, PENDING, REJECTED, BaseBroker, fill_info
 
 # Etiquetas de accountSummary que usamos
 _TAGS = {"NetLiquidation": "equity", "TotalCashValue": "cash", "BuyingPower": "buying_power"}
@@ -103,6 +103,20 @@ class IBKRBroker(BaseBroker):
         contract = self.conn.qualify(symbol)
         order = self._order("BUY" if side == "buy" else "SELL", abs(qty), is_crypto(symbol))
         return self._place(contract, order)
+
+    # Inactive = rechazada por IBKR (margen, permisos, contrato…)
+    _STATUS = {"Filled": FILLED, "Cancelled": CANCELED, "ApiCancelled": CANCELED,
+               "Inactive": REJECTED}
+
+    def order_fill(self, order) -> dict:
+        """Lee ``trade.orderStatus`` (ib_async lo actualiza en su hilo): avgFillPrice / filled."""
+        trade = getattr(order, "trade", None)
+        st = getattr(trade, "orderStatus", None)
+        if st is None:
+            return fill_info(PENDING)
+        filled = getattr(st, "filled", None)
+        status = self._STATUS.get(getattr(st, "status", ""), PARTIAL if filled else PENDING)
+        return fill_info(status, filled, getattr(st, "avgFillPrice", None))
 
     def _close_item(self, item):
         from ib_async import Contract

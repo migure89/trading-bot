@@ -8,6 +8,9 @@ on:
       trials:
         description: "Número de trials de Optuna"
         default: "100"
+      config_json:
+        description: "Config de producción a optimizar (JSON con symbols/timeframe/strategy_params; vacío = variable OPTIMIZER_CONFIG_JSON o valores por defecto)"
+        default: ""
 
 permissions:
   contents: read
@@ -38,9 +41,39 @@ jobs:
           fi
       - run: pip install -r requirements.txt
       - run: mkdir -p artifacts
+      - name: Cargar la configuración de producción (si se proporciona)
+        env:
+          CONFIG_JSON: ${{ github.event.inputs.config_json || vars.OPTIMIZER_CONFIG_JSON }}
+        run: |
+          if [ -n "$CONFIG_JSON" ]; then
+            python -c 'import json, os; from config.settings import SettingsStore; SettingsStore().update(json.loads(os.environ["CONFIG_JSON"]))'
+          else
+            echo "::warning::Sin config de producción: se optimizan los parámetros por defecto"
+          fi
       - name: Ejecutar optimización (no aplica en producción, solo informa)
-        run: python -m optimization.optimizer --trials ${{ github.event.inputs.trials || '100' }} --no-apply | tee artifacts/optimization.json
+        env:
+          TRIALS: ${{ github.event.inputs.trials || '100' }}
+        # Resultado -> artifacts/optimization.json; logs JSON -> stderr (log del job) y artifacts/optimizer.log
+        run: |
+          set -o pipefail
+          python -m optimization.optimizer --trials "$TRIALS" --no-apply \
+            --output artifacts/optimization.json 2> >(tee artifacts/optimizer.log >&2)
+      - name: Validar el JSON y resumir
+        if: always()
+        run: |
+          jq -e '.results | type == "array"' artifacts/optimization.json
+          {
+            echo "### Resultados de la optimización"
+            echo "| Símbolo | Mejora OOS | Aplicable | Sharpe OOS | Retorno OOS | Trades OOS | Motivo de rechazo |"
+            echo "|---|---|---|---|---|---|---|"
+            jq -r '.results[] | "| \(.symbol) | \(.improved) | \(.applicable) | \(.best_oos.sharpe * 100 | round / 100) | \(.best_oos.total_return * 10000 | round / 100) % | \(.best_oos.num_trades) | \((.rejected_reason // []) | join("; ")) |"' artifacts/optimization.json
+            jq -r '.errors[] | "| \(.symbol) | error: \(.error) | | | | | |"' artifacts/optimization.json
+            jq -r '"Criterios: " + (.criteria // {} | tostring)' artifacts/optimization.json
+            echo
+            echo 'Para aplicar el ganador (solo los aplicables; se reevalúan los criterios): descarga el artefacto y ejecuta `python -m optimization.optimizer --apply-report optimization.json` junto al bot.'
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: optimization-results
           path: artifacts/

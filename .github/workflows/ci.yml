@@ -24,8 +24,33 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -r requirements.txt
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
       - name: Lint (ruff)
         run: ruff check .
       - name: Tests (pytest, sin credenciales)
         run: pytest -q
+
+  docker:
+    # Construye la imagen y comprueba que no incluye secretos ni ficheros locales (.dockerignore).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Crear ficheros locales falsos que NO deben acabar en la imagen
+        run: |
+          echo "APCA_API_SECRET_KEY=no-debe-estar-en-la-imagen" > .env
+          echo "x" > .env.local
+          mkdir -p .venv && touch .venv/marker config/settings.db && echo "x" > config/.env
+      - name: Build
+        run: docker build -t trading-bot:ci .
+      - name: Comprobar el contenido de la imagen
+        run: |
+          docker run --rm --entrypoint sh trading-bot:ci -c '
+            set -e
+            for f in /app/.env /app/.env.local /app/.venv /app/.git /app/config/settings.db /app/config/.env; do
+              if [ -e "$f" ]; then echo "ERROR: $f está dentro de la imagen"; exit 1; fi
+            done
+            test -f /app/.env.example && test -f /app/main.py
+            python -c "import api.main, main"
+            echo "Imagen OK: sin .env, .venv, .git ni settings.db"'

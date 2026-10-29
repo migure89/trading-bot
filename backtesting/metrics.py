@@ -5,7 +5,26 @@ import numpy as np
 import pandas as pd
 
 PERIODS_PER_YEAR = {"1Min": 252 * 390, "5Min": 252 * 78, "15Min": 252 * 26,
-                    "1Hour": 252 * 7, "1Day": 252}
+                    "1Hour": 252 * 7, "1Day": 252}   # sesión regular de acciones (referencia)
+
+
+def infer_periods_per_year(index, timeframe: str = "1Hour") -> int:
+    """Periodos por año según las barras reales: mediana de barras por día × días de mercado.
+
+    Con sesión regular salen ~7 barras/día en 1Hour (1764/año); con horario extendido ~16; cripto
+    (24/7, con fines de semana) usa 365 días. Si no hay suficientes datos, la tabla de referencia.
+    """
+    fallback = PERIODS_PER_YEAR.get(timeframe, 252)
+    if not isinstance(index, pd.DatetimeIndex) or len(index) < 2:
+        return fallback
+    local = index.tz_convert("America/New_York") if index.tz is not None else index
+    days = pd.Series(1, index=local).groupby(local.date).sum()
+    if len(days) < 2:
+        return fallback
+    full = days.iloc[1:-1] if len(days) > 3 else days          # el primer/último día pueden ser parciales
+    per_day = max(1, int(round(float(full.median()))))
+    weekends = any(pd.Timestamp(d).weekday() >= 5 for d in days.index)
+    return per_day * (365 if weekends else 252)
 
 
 def sharpe_ratio(returns: pd.Series, periods_per_year: int = 252) -> float:

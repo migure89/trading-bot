@@ -201,7 +201,9 @@ def test_bot_hot_switches_broker(store, fake_trading_client, ibkr_conn, fake_ib,
     from execution.factory import BrokerRegistry
 
     monkeypatch.setattr(main, "latest_action", lambda df, p: "buy")
-    fake_ib.bars = make_bars(200, start=datetime(2026, 9, 20, tzinfo=UTC))
+    # Barras recientes: el proveedor filtra por lookback_days respecto a "ahora"
+    fake_ib.bars = make_bars(200, start=datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+                             - timedelta(hours=200))
     alpaca_provider = SimpleNamespace(name="alpaca", get_bars=lambda *a, **k: pd.DataFrame())
     brokers = BrokerRegistry({"alpaca": lambda: AlpacaBroker(lambda paper: fake_trading_client),
                               "ibkr": lambda: IBKRBroker(ibkr_conn)})
@@ -222,6 +224,6 @@ def test_bot_hot_switches_broker(store, fake_trading_client, ibkr_conn, fake_ib,
 def test_bot_reports_broker_unavailable(store):
     fake = FakeIB(fail_connect=True)
     bot = TradingBot(store, IBKRDataProvider(make_conn(fake)), IBKRBroker(make_conn(fake)))
-    store.update({"broker": "ibkr"})
+    store.update({"broker": "ibkr", "bot_enabled": True})   # en pausa ni siquiera se conecta (#7)
     out = bot.iteration()
     assert out["status"] == "broker_unavailable" and out["broker"] == "ibkr"

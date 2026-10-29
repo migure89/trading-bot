@@ -1,6 +1,6 @@
 [tool.ruff]
 line-length = 110
-target-version = "py311"
+target-version = "py312"  # misma versión que CI y Docker
 extend-exclude = [".venv"]
 
 [tool.ruff.lint]
@@ -10,3 +10,7 @@ ignore = ["B008"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+filterwarnings = [
+    # alpaca-py importa websockets.legacy (aviso de terceros, no de este código)
+    "ignore:websockets.legacy is deprecated:DeprecationWarning",
+]

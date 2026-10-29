@@ -1,0 +1,6 @@
+# Desarrollo y tests (CI): pip install -r requirements-dev.txt
+-r requirements.txt
+pytest>=8.0,<10
+httpx2>=2.16,<3           # cliente de starlette.testclient (sustituye a httpx, obsoleto)
+ruff>=0.6,<1
+pyyaml>=6,<7              # validación de los workflows en los tests
