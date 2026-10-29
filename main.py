@@ -14,13 +14,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import time
 from datetime import UTC, datetime, timedelta
 
 from config.settings import LiveTradingNotConfirmed, SettingsStore, resolve_data_provider
 from core.registry import resolve
 from core.schedule import DEFAULT_DAILY_RUN_TIME, DailyGate, completed_daily_bars, effective_lookback
+from core.shutdown import GracefulShutdown, ShutdownRequested
 from data.base import is_crypto
 from data.factory import DataProviderRegistry
 from execution.base import CANCELED, FILLED, PARTIAL, REJECTED, BaseBroker
@@ -54,7 +54,8 @@ class TradingBot:
 
     def __init__(self, store: SettingsStore, provider, broker,
                  healthcheck_interval: int | None = None, clock=time.monotonic,
-                 now=None, shadow: ShadowRunner | None = None) -> None:
+                 now=None, shadow: ShadowRunner | None = None,
+                 shutdown: GracefulShutdown | None = None) -> None:
         self.store, self.provider, self.broker = store, provider, broker
         self._now = now or (lambda: datetime.now(UTC))
         # La sombra solo recibe el store y los datos: no tiene forma de llegar al broker.
@@ -67,6 +68,7 @@ class TradingBot:
         self._clock = clock
         self._last_healthcheck: float | None = None  # monotonic del último health-check en pausa
         self.running = True
+        self.shutdown = shutdown or GracefulShutdown()
         self._paused: bool | None = None           # para registrar la pausa solo al cambiar
         self._failures = 0                          # fallos consecutivos del broker (backoff)
         self._last_error: tuple[str, str] | None = None
@@ -106,6 +108,12 @@ class TradingBot:
 
         Las órdenes rechazadas o canceladas sin ejecutar no se registran como trades.
         """
+        # Envío + espera + registro sin interrupción por la primera señal (acotado por timeouts).
+        with self.shutdown.critical():
+            return self._execute(symbol, side, qty, ref_price, cfg, broker, entry_price)
+
+    def _execute(self, symbol: str, side: str, qty: float, ref_price: float, cfg: dict,
+                 broker: BaseBroker, entry_price: float | None) -> str:
         order = broker.market_order(symbol, qty, side)
         fill = broker.wait_fill(order)
         order_id = str(getattr(order, "id", ""))
@@ -269,20 +277,31 @@ class TradingBot:
             return interval
         return int(min(max(interval, 5) * 2 ** (self._failures - 1), max(BACKOFF_MAX_SEC, interval)))
 
+    def stop(self) -> None:
+        self.running = False
+        self.shutdown.request()
+
     def run(self) -> None:
-        signal.signal(signal.SIGTERM, lambda *_: setattr(self, "running", False))
-        while self.running:
-            try:
-                self.iteration()
-            except Exception:
-                exporter.ERRORS.inc()
-                log.exception("error en iteración")
-            interval = self.next_delay(int(self.store.get("loop_interval_sec", 60)))
-            for _ in range(interval):
-                if not self.running:
+        """Bucle principal. SIGTERM/SIGINT lo paran en pocos segundos (ver ``core.shutdown``)."""
+        # Si main() ya instaló los manejadores, no los reinstalamos ni los restauramos aquí.
+        installed = not self.shutdown.installed and self.shutdown.install()
+        try:
+            while self.running and not self.shutdown.requested:
+                try:
+                    self.iteration()
+                except Exception:
+                    exporter.ERRORS.inc()
+                    log.exception("error en iteración")
+                interval = self.next_delay(int(self.store.get("loop_interval_sec", 60)))
+                if self.shutdown.wait(interval):
                     break
-                time.sleep(1)
-        log.info("bot detenido")
+        except ShutdownRequested as exc:
+            log.info("llamada en curso interrumpida por la parada", extra={"signal": str(exc)})
+        finally:
+            if installed:
+                self.shutdown.restore()
+            self.running = False
+            log.info("bot detenido")
 
 
 def main() -> None:
@@ -301,13 +320,25 @@ def main() -> None:
         snapshot = ShadowRunner(store, DataProviderRegistry()).run(cfg)
         print(json.dumps(snapshot, default=str, ensure_ascii=False))
         return
-    if not args.no_metrics:
-        exporter.start_exporter()
-    bot = TradingBot(SettingsStore(), DataProviderRegistry(), BrokerRegistry())
-    if args.once:
-        print(json.dumps(bot.iteration(), default=str))
-    else:
-        bot.run()
+    # Los manejadores se instalan antes de arrancar el exporter: una señal durante el
+    # arranque (p. ej. un SIGTERM temprano de systemd/docker) también produce una salida limpia.
+    shutdown = GracefulShutdown()
+    installed = not args.once and shutdown.install()
+    metrics = None
+    try:
+        with shutdown.critical():  # una señal aquí se aplaza hasta tener el handle para cerrarlo
+            metrics = None if args.no_metrics else exporter.start_exporter()
+        bot = TradingBot(SettingsStore(), DataProviderRegistry(), BrokerRegistry(), shutdown=shutdown)
+        if args.once:
+            print(json.dumps(bot.iteration(), default=str))
+        else:
+            bot.run()
+    except ShutdownRequested as exc:
+        log.info("parada solicitada durante el arranque", extra={"signal": str(exc)})
+    finally:
+        exporter.stop_exporter(metrics)
+        if installed:
+            shutdown.restore()
 
 
 if __name__ == "__main__":
