@@ -18,13 +18,23 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from core.env import load_env
+from core.schedule import DEFAULT_DAILY_RUN_TIME, MIN_DAILY_LOOKBACK_DAYS, parse_hhmm
 from data.base import TIMEFRAMES
+from monitoring.logger import get_logger
+from strategies.registry import SHADOW_CHOICES
 
 load_env()  # antes de leer SETTINGS_DB_PATH, CONFIRM_LIVE_TRADING, etc.
 
 BASE_DIR = Path(__file__).resolve().parent
 SCHEMA_PATH = BASE_DIR / "schema.sql"
 DEFAULT_DB_PATH = BASE_DIR / "settings.db"
+
+
+log = get_logger("settings")
+
+# Migraciones de datos de la tabla ``settings`` (se aplican una sola vez por BD).
+LEGACY_TIMEFRAME, DAILY_TIMEFRAME = "1Hour", "1Day"
+MIGRATIONS = ("2026-10-daily-bars",)
 
 
 def default_db_path() -> Path:
@@ -38,9 +48,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "bot_enabled": False,         # kill switch: False = pausado
     "symbols": ["AAPL", "MSFT"],  # activos (acciones o cripto tipo "BTC/USD")
     "risk_pct": 1.0,              # % del equity arriesgado por operación
-    "timeframe": "1Hour",         # 1Min | 5Min | 15Min | 1Hour | 1Day
+    "timeframe": "1Day",          # 1Min | 5Min | 15Min | 1Hour | 1Day (diario: una ejecución al día)
     "loop_interval_sec": 60,
-    "lookback_days": 30,
+    "lookback_days": 420,         # en 1Day se fuerza un mínimo de 420 (calentamiento de indicadores)
+    "daily_run_time": DEFAULT_DAILY_RUN_TIME,  # HH:MM ET: con 1Day se opera una vez al día a esa hora
+    "shadow_strategy": "blend",   # off | blend | trend_sma | rsi2  (solo señales, NUNCA órdenes)
+    "shadow_symbols": ["SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META",
+                       "JPM", "XOM", "KO"],
     "regular_hours_only": True,   # acciones: solo sesión regular (09:30-16:00 ET) en señales y backtests
     "strategy_params": {
         "ema_fast": 12,
@@ -164,11 +178,41 @@ class SettingsStore:
                 conn.execute("ALTER TABLE trades ADD COLUMN broker TEXT")
             if "status" not in cols:
                 conn.execute("ALTER TABLE trades ADD COLUMN status TEXT")
+            existing = {r["key"]: json.loads(r["value"])
+                        for r in conn.execute("SELECT key, value FROM settings")}
             for key, value in DEFAULT_SETTINGS.items():
                 conn.execute(
                     "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
                     (key, json.dumps(value)),
                 )
+            applied = {r["name"] for r in conn.execute("SELECT name FROM migrations")}
+            for name in MIGRATIONS:
+                if name not in applied:
+                    self._migrate(conn, name, existing)
+                    conn.execute("INSERT INTO migrations(name) VALUES (?)", (name,))
+
+    @staticmethod
+    def _migrate(conn, name: str, existing: dict[str, Any]) -> None:
+        """Migraciones de configuración de BDs existentes (las BDs nuevas ya nacen con los defaults)."""
+        if name == "2026-10-daily-bars" and existing:
+            # El bot pasa a barras diarias: solo se migra el valor por defecto antiguo (1Hour);
+            # cualquier otro timeframe elegido a mano se respeta. En diario, lookback >= 420 días.
+            changes: dict[str, Any] = {}
+            tf = existing.get("timeframe", LEGACY_TIMEFRAME)
+            if tf == LEGACY_TIMEFRAME:
+                changes["timeframe"] = DAILY_TIMEFRAME
+                tf = DAILY_TIMEFRAME
+            lookback = existing.get("lookback_days")
+            too_short = not isinstance(lookback, int) or lookback < MIN_DAILY_LOOKBACK_DAYS
+            if tf == DAILY_TIMEFRAME and too_short:
+                changes["lookback_days"] = MIN_DAILY_LOOKBACK_DAYS
+            for key, value in changes.items():
+                conn.execute("UPDATE settings SET value=?, updated_at=datetime('now') WHERE key=?",
+                             (json.dumps(value), key))
+            if changes:
+                log.info("configuración migrada a barras diarias",
+                         extra={"migration": name, "before": {k: existing.get(k) for k in changes},
+                                "after": changes})
 
     # ---- lectura / escritura -------------------------------------------
     def load(self) -> dict[str, Any]:
@@ -235,6 +279,17 @@ class SettingsStore:
                 value = changes[key]
                 if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
                     raise ValueError(f"{key} debe ser un entero entre {lo} y {hi}")
+        if "daily_run_time" in changes:
+            parse_hhmm(changes["daily_run_time"])
+            changes["daily_run_time"] = str(changes["daily_run_time"]).strip()
+        if "shadow_strategy" in changes:
+            shadow = str(changes["shadow_strategy"]).strip().lower()
+            if shadow not in SHADOW_CHOICES:
+                raise ValueError(f"shadow_strategy inválido: {shadow} "
+                                 f"(admitidos: {', '.join(SHADOW_CHOICES)})")
+            changes["shadow_strategy"] = shadow
+        if "shadow_symbols" in changes:
+            changes["shadow_symbols"] = normalize_symbols(changes["shadow_symbols"])
         if "bot_enabled" in changes and not isinstance(changes["bot_enabled"], bool):
             raise ValueError("bot_enabled debe ser true/false")
         if "regular_hours_only" in changes and not isinstance(changes["regular_hours_only"], bool):
@@ -278,6 +333,18 @@ class SettingsStore:
                 "VALUES (?,?,?,?,?,?,?,?,?)",
                 (symbol, side, qty, price, mode, broker, order_id, pnl, status),
             )
+
+    # ---- señales en sombra (nunca generan órdenes) ---------------------
+    def record_shadow(self, snapshot: dict) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute("INSERT INTO shadow_signals(strategy, as_of, payload) VALUES (?,?,?)",
+                         (snapshot["strategy"], snapshot.get("as_of"), json.dumps(snapshot, default=str)))
+
+    def shadow_history(self, limit: int = 30) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT payload FROM shadow_signals ORDER BY id DESC LIMIT ?",
+                                (limit,)).fetchall()
+        return [json.loads(r["payload"]) for r in rows]
 
     def trades(self, limit: int = 500) -> list[dict]:
         with self._conn() as conn:

@@ -60,3 +60,23 @@ def update_account(account: dict, n_positions: int, enabled: bool | None = None,
         BOT_ENABLED.set(int(enabled))
     if mode is not None:
         LIVE_MODE.set(int(mode == "live"))
+
+
+# ---- estrategia en sombra (solo señales; nunca órdenes) -------------------------
+SHADOW_WEIGHT = Gauge("bot_shadow_target_weight",
+                      "Peso objetivo de la estrategia en sombra (no se opera)", ["strategy", "symbol"])
+SHADOW_EXPOSURE = Gauge("bot_shadow_gross_exposure", "Exposición total objetivo de la sombra", ["strategy"])
+SHADOW_REGIME = Gauge("bot_shadow_regime_bull", "1 si SPY > SMA200 en la última barra diaria")
+SHADOW_LAST_RUN = Gauge("bot_shadow_last_run_timestamp_seconds", "Momento (epoch) de la última sombra")
+SHADOW_ERRORS = Counter("bot_shadow_errors_total", "Errores al calcular la estrategia en sombra")
+
+
+def update_shadow(snapshot: dict) -> None:
+    SHADOW_WEIGHT.clear()
+    SHADOW_EXPOSURE.clear()
+    strategy = snapshot.get("strategy", "")
+    for symbol, weight in (snapshot.get("weights") or {}).items():
+        SHADOW_WEIGHT.labels(strategy, symbol).set(weight)
+    SHADOW_EXPOSURE.labels(strategy).set(snapshot.get("gross_exposure", 0))
+    SHADOW_REGIME.set(int(bool(snapshot.get("regime_bull"))))
+    SHADOW_LAST_RUN.set_to_current_time()

@@ -3,6 +3,11 @@
 En cada iteración relee la configuración (hot-reload), elige el broker y el
 proveedor de datos activos (Alpaca o Interactive Brokers), respeta el kill switch,
 descarga datos, calcula la señal y ejecuta órdenes dimensionadas por riesgo.
+
+Con ``timeframe=1Day`` (por defecto) opera **una vez por día hábil** a ``daily_run_time``
+(09:35 ET): señal con la última barra diaria cerrada y orden de mercado en la apertura.
+La estrategia en sombra (``shadow_strategy``) se calcula también una vez al día, esté el
+bot activo o en pausa, y **nunca** envía órdenes (``shadow.runner`` no recibe broker).
 """
 from __future__ import annotations
 
@@ -11,21 +16,25 @@ import json
 import os
 import signal
 import time
+from datetime import UTC, datetime, timedelta
 
 from config.settings import LiveTradingNotConfirmed, SettingsStore, resolve_data_provider
 from core.registry import resolve
+from core.schedule import DEFAULT_DAILY_RUN_TIME, DailyGate, completed_daily_bars, effective_lookback
 from data.base import is_crypto
 from data.factory import DataProviderRegistry
 from execution.base import CANCELED, FILLED, PARTIAL, REJECTED, BaseBroker
 from execution.factory import BrokerRegistry
 from monitoring import exporter
 from monitoring.logger import get_logger, install_excepthook
+from shadow.runner import ShadowRunner
 from strategies.ema_rsi import latest_action
 from strategies.indicators import atr
 
 log = get_logger("bot")
 
 BACKOFF_MAX_SEC = 300  # tope del backoff exponencial ante fallos del broker
+SHADOW_RETRY_SEC = 900  # reintento de la sombra tras un error (sin datos, calendario…)
 PAUSED_HEALTHCHECK_DEFAULT_SEC = 300  # health-check de solo lectura con el bot en pausa (0 = desactivado)
 
 
@@ -44,8 +53,15 @@ class TradingBot:
     """``provider`` y ``broker`` pueden ser una instancia fija o un registro (selección en caliente)."""
 
     def __init__(self, store: SettingsStore, provider, broker,
-                 healthcheck_interval: int | None = None, clock=time.monotonic) -> None:
+                 healthcheck_interval: int | None = None, clock=time.monotonic,
+                 now=None, shadow: ShadowRunner | None = None) -> None:
         self.store, self.provider, self.broker = store, provider, broker
+        self._now = now or (lambda: datetime.now(UTC))
+        # La sombra solo recibe el store y los datos: no tiene forma de llegar al broker.
+        self.shadow = shadow or ShadowRunner(store, provider)
+        self._shadow_gate = DailyGate()
+        self._trade_gate = DailyGate(until_close=True)
+        self._shadow_retry_at: datetime | None = None
         self.healthcheck_interval = (paused_healthcheck_seconds() if healthcheck_interval is None
                                      else max(0, int(healthcheck_interval)))
         self._clock = clock
@@ -64,8 +80,10 @@ class TradingBot:
         if broker is None or provider is None:
             broker, provider = self.active(cfg)
         params = cfg["strategy_params"]
-        df = provider.get_bars(symbol, cfg["timeframe"], cfg["lookback_days"],
+        df = provider.get_bars(symbol, cfg["timeframe"], effective_lookback(cfg),
                                regular_hours=cfg.get("regular_hours_only", True))
+        if cfg["timeframe"] == "1Day":
+            df = completed_daily_bars(df, self._now())   # sin la barra de hoy aún abierta
         action = latest_action(df, params)
         held = broker.position_qty(symbol)
         price = float(df["close"].iloc[-1]) if len(df) else 0.0
@@ -116,6 +134,35 @@ class TradingBot:
         exporter.ITERATIONS.inc()
         exporter.LAST_ITERATION.set_to_current_time()
         exporter.update_config(cfg)          # bot_enabled / bot_live_mode / bot_info / bot_paused
+        shadow = self.maybe_run_shadow(cfg)  # solo señales; corre también en pausa
+        out = self._iteration(cfg)
+        if shadow:
+            out["shadow"] = shadow
+        return out
+
+    def maybe_run_shadow(self, cfg: dict) -> str | None:
+        """Estrategia en sombra una vez al día. Nunca lanza excepciones ni toca el broker."""
+        if cfg.get("shadow_strategy", "off") == "off":
+            return None
+        now = self._now()
+        if self._shadow_retry_at is not None and now < self._shadow_retry_at:
+            return None
+        try:
+            provider = resolve(self.provider, resolve_data_provider(cfg))
+            if not self._shadow_gate.due(now, cfg.get("daily_run_time", DEFAULT_DAILY_RUN_TIME), provider):
+                return None
+            self.shadow.run(cfg, now)
+        except Exception as exc:  # noqa: BLE001 - la sombra no puede tumbar el bot
+            exporter.SHADOW_ERRORS.inc()
+            self._shadow_retry_at = now + timedelta(seconds=SHADOW_RETRY_SEC)
+            log.warning("error en la estrategia en sombra", extra={"error": str(exc) or type(exc).__name__,
+                                                                    "retry_in_sec": SHADOW_RETRY_SEC})
+            return "error"
+        self._shadow_retry_at = None
+        self._shadow_gate.mark(now)
+        return "ok"
+
+    def _iteration(self, cfg: dict) -> dict:
         if not cfg["bot_enabled"]:
             # En pausa no se opera: como mucho un health-check de solo lectura a baja frecuencia.
             if self._paused is not True:
@@ -131,6 +178,15 @@ class TradingBot:
         self._last_healthcheck = None
 
         broker, provider = self.active(cfg)
+        daily = cfg["timeframe"] == "1Day"
+        now = self._now()
+        run_time = cfg.get("daily_run_time", DEFAULT_DAILY_RUN_TIME)
+        if daily and not self._trade_gate.due(now, run_time, provider):
+            # Diario: fuera de la ventana de ejecución solo un health-check de solo lectura.
+            out = {"status": "waiting_daily_run", "broker": cfg["broker"]}
+            if self._healthcheck_due():
+                out["healthcheck"] = self.paused_healthcheck(cfg)
+            return out
         try:
             broker.ensure_mode(cfg["mode"])
             account = broker.account()
@@ -152,6 +208,9 @@ class TradingBot:
                 log.exception("error procesando símbolo", extra={"symbol": symbol})
                 actions[symbol] = "error"
         exporter.LAST_SUCCESS.set_to_current_time()
+        if daily:
+            self._trade_gate.mark(now)
+            log.info("ejecución diaria completada", extra={"actions": actions, "broker": broker.name})
         return {"status": "ok", "broker": broker.name, "actions": actions}
 
     def _healthcheck_due(self) -> bool:
@@ -231,7 +290,17 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Bot de trading cuantitativo (Alpaca / Interactive Brokers)")
     ap.add_argument("--once", action="store_true", help="ejecuta una sola iteración")
     ap.add_argument("--no-metrics", action="store_true", help="no arranca el exporter Prometheus")
+    ap.add_argument("--shadow-once", action="store_true",
+                    help="calcula ahora la estrategia en sombra y sale (sin broker ni órdenes)")
     args = ap.parse_args()
+    if args.shadow_once:
+        store = SettingsStore()
+        cfg = store.load()
+        if cfg.get("shadow_strategy", "off") == "off":
+            raise SystemExit("shadow_strategy=off")
+        snapshot = ShadowRunner(store, DataProviderRegistry()).run(cfg)
+        print(json.dumps(snapshot, default=str, ensure_ascii=False))
+        return
     if not args.no_metrics:
         exporter.start_exporter()
     bot = TradingBot(SettingsStore(), DataProviderRegistry(), BrokerRegistry())

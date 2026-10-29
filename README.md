@@ -106,6 +106,7 @@ tests y lint; Dependabot (`.github/dependabot.yml`) propone las actualizaciones.
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt         # o requirements.txt si solo vas a ejecutar
 python main.py --once                       # una iteración de prueba
+python main.py --shadow-once                # calcula y registra las señales en sombra (sin broker)
 python main.py                              # bucle continuo
 uvicorn api.main:app --reload               # API
 API_URL=http://localhost:8000 streamlit run dashboard/app.py
@@ -117,7 +118,8 @@ pytest -q && ruff check .
 
 Claves en la tabla `settings`: `mode`, `broker` (`alpaca` | `ibkr`), `data_provider`
 (`auto` = el del broker, `alpaca` o `ibkr`), `bot_enabled`, `symbols` (p.ej. `["AAPL","BTC/USD"]`),
-`risk_pct`, `timeframe`, `loop_interval_sec`, `lookback_days`, `regular_hours_only`, `strategy_params`.
+`risk_pct`, `timeframe`, `loop_interval_sec`, `lookback_days`, `regular_hours_only`, `strategy_params`,
+`daily_run_time`, `shadow_strategy` y `shadow_symbols` (secciones 4.2 y 5.2).
 El bot las relee en **cada iteración**; si cambia `mode`, se recrea el `TradingClient` de Alpaca con
 `paper=True/False` o se reconecta a IBKR en el puerto paper/live; si cambia `broker`, la siguiente
 iteración ya opera con el nuevo broker. Las BDs antiguas se migran solas al arrancar.
@@ -144,6 +146,35 @@ after-hours tienen poco volumen y distorsionan las señales, el ATR y el Sharpe.
   barras en fin de semana, como en cripto): 7 × 252 en `1Hour` con sesión regular, ~16 × 252 con horario
   extendido. Antes se usaba siempre 7 × 252.
 
+### 4.2 Modo diario (por defecto) y precios ajustados
+
+El bot trabaja por defecto con **barras diarias** (`timeframe: "1Day"`, `lookback_days: 420`; en diario
+se usan como mínimo 420 días, ~290 sesiones, para la SMA200 y el calentamiento de los indicadores):
+
+- **Una ejecución al día** a la hora `daily_run_time` (por defecto `"09:35"`, **hora de Nueva York**,
+  = 14:35/15:35 en Madrid según el horario de verano). La señal se calcula con la **última barra diaria
+  cerrada** (la de ayer; la barra del día en curso se descarta hasta las 16:15 ET) y la orden de mercado se
+  envía poco después de la apertura: *señal al cierre, ejecución en la apertura siguiente*, igual que el
+  backtest. Solo en días hábiles (calendario de Alpaca: festivos y cierres anticipados; si no, lunes a
+  viernes) y con el mercado abierto: si el bot arranca después del cierre, ese día no opera.
+- Entre ejecuciones el bucle sigue corriendo cada `loop_interval_sec` (estado `waiting_daily_run`) y solo
+  hace el health-check de solo lectura. El "ya ejecutado hoy" se guarda en memoria: si se reinicia el bot
+  durante la sesión vuelve a evaluar ese día (inofensivo: solo compra si no hay posición y solo vende si la hay).
+- `"timeframe": "1Hour"` (u otro intradía) sigue funcionando como antes (una evaluación por iteración).
+- **Migración:** al arrancar, las BDs existentes que tenían el antiguo valor por defecto (`1Hour`) pasan
+  a `1Day` con `lookback_days` ≥ 420 (una sola vez, registrada en la tabla `migrations`; se escribe el
+  log `configuración migrada a barras diarias`). Un timeframe elegido a mano (p.ej. `15Min`) se respeta,
+  y si después vuelves a `1Hour` no se vuelve a migrar.
+
+**Precios ajustados** por splits y dividendos (sin ellos un split aparece como un desplome, p.ej. NVDA
+-90 % el 10-06-2024, y dispara salidas y stops falsos):
+
+- **Alpaca:** `adjustment=all` en las barras de acciones. `ALPACA_ADJUSTMENT=raw|split|dividend|all`
+  lo cambia (un valor inválido registra un WARNING y usa `all`). Cripto no lleva ajuste.
+- **IBKR:** las barras diarias de acciones se piden con `whatToShow=ADJUSTED_LAST` (exige
+  `endDateTime=""`: una sola petición de N años que luego se recorta a las fechas pedidas).
+  `IBKR_ADJUSTED_DAILY=false` vuelve a `TRADES`. Las intradía siguen con `TRADES` y cripto con `AGGTRADES`.
+
 ## 5. Estrategia y riesgo
 
 - **Entrada:** EMA rápida > EMA lenta, RSI < sobrecompra y cierre < Bollinger superior.
@@ -155,6 +186,9 @@ after-hours tienen poco volumen y distorsionan las señales, el ATR y el Sharpe.
   ejecutar no cuentan como trades. En las ventas se guarda el **PnL realizado**:
   `(precio de venta − avg_entry_price del broker) × cantidad` (sin comisiones).
 
+La estrategia que **opera** sigue siendo `ema_rsi` (la única con `trades=True` en
+`strategies/registry.py`).
+
 ### 5.1 Validación de la configuración
 
 `POST /config` rechaza con **422** claves desconocidas, `timeframe` fuera de
@@ -162,9 +196,48 @@ after-hours tienen poco volumen y distorsionan las señales, el ATR y el Sharpe.
 mayúsculas y sin duplicados), `lookback_days` > 3650, `risk_pct` fuera de (0, 10],
 `regular_hours_only` que no sea booleano y `strategy_params`
 con claves desconocidas, tipos erróneos o reglas incoherentes (`ema_fast < ema_slow`,
-`rsi_oversold < rsi_overbought`). El kill switch se cambia con `/toggle-bot`, no con `/config`.
+`rsi_oversold < rsi_overbought`), `daily_run_time` que no sea `HH:MM`, `shadow_strategy` fuera de
+`off|blend|trend_sma|rsi2` y `shadow_symbols` inválidos. El kill switch se cambia con `/toggle-bot`, no con `/config`.
+
+### 5.2 Estrategias en sombra (solo señales, **nunca órdenes**)
+
+`strategies/registry.py` registra además tres estrategias de cartera diarias con **parámetros fijos**
+(validadas en la investigación con walk-forward; el optimizador no las toca):
+
+| Estrategia | Reglas |
+|---|---|
+| `trend_sma` | Largo 1/N en cada símbolo con SMA50 > SMA200, solo con régimen alcista (SPY > SMA200) |
+| `rsi2` | Entra con RSI(2) < 10 y cierre > SMA200 (régimen alcista); sale al cerrar sobre la SMA5; máx. 4 posiciones de 1/4 (las nuevas por menor RSI2) |
+| `blend` | 50 % `trend_sma` + 50 % `rsi2` (por defecto) |
+
+`shadow_strategy` (`blend` por defecto; `trend_sma`, `rsi2` u `off`) elige cuál se ejecuta **en sombra**
+sobre `shadow_symbols` (por defecto SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, GOOGL, META, JPM, XOM, KO).
+Una vez por día hábil a partir de `daily_run_time` (aunque el bot esté **en pausa**) el bot descarga barras
+diarias ajustadas, calcula los **pesos objetivo** con la última barra cerrada y los registra. Garantía en
+código: `shadow/runner.py` no importa nada de `execution` ni recibe un broker (lo comprueban los tests),
+así que no puede enviar órdenes aunque el bot esté activo. Si falla (p.ej. sin datos) se reintenta en
+15 min y no afecta al bot.
+
+Dónde verlas:
+
+- **API:** `GET /shadow?limit=30` → `{"strategy", "symbols", "daily_run_time", "orders": false, "latest", "history"}`.
+  `latest` incluye `as_of` (última barra cerrada), `regime_bull`, `weights`, `gross_exposure`,
+  `changes` (entrar/salir/ajustar respecto al día anterior), `components` (pesos de cada mitad de la
+  mezcla), `params`, `errors` y `orders_sent: 0`. Se guardan en la tabla `shadow_signals`.
+- **Dashboard:** pestaña **"Sombra (sin órdenes)"**.
+- **Prometheus:** `bot_shadow_target_weight{strategy,symbol}`, `bot_shadow_gross_exposure{strategy}`,
+  `bot_shadow_regime_bull`, `bot_shadow_last_run_timestamp_seconds`, `bot_shadow_errors_total`.
+- **Logs JSON:** `"msg": "señales en sombra (sin órdenes)"` con el snapshot en el campo `shadow`.
+- **A mano:** `python main.py --shadow-once` (imprime el JSON; solo datos, sin broker).
+
+`backtesting/portfolio.py` (`backtest_strategy(bars, "blend")`) hace el backtest de estas estrategias de
+cartera con la misma convención (señal al cierre, ejecución en la apertura siguiente, coste por lado).
 
 ## 6. Autoaprendizaje
+
+> Solo optimiza y aplica `strategy_params` de `ema_rsi`; las estrategias en sombra tienen parámetros fijos
+> y nunca se autoaplican. En diario usa ~5 años de histórico (`max(3 × lookback, 1825 días)`, ~1260
+> barras) para que el tramo de validación tenga operaciones suficientes; si no las tiene, no aplica nada.
 
 `optimization/optimizer.py` divide el histórico reciente en entrenamiento (70 %) y validación (30 %),
 busca parámetros con Optuna (TPE) maximizando una puntuación compuesta (Sharpe + Profit Factor +
@@ -213,6 +286,7 @@ Todas las rutas salvo `/health` exigen `API_TOKEN` si está definido (sección 2
 | POST | `/cancel-orders` | Cancela todas las órdenes abiertas del broker activo |
 | POST | `/close-position` | Cierra una posición concreta |
 | GET | `/metrics` | Métricas, operaciones e historial de optimización |
+| GET | `/shadow` | Señales y pesos objetivo de la estrategia en sombra (último + historial; nunca órdenes) |
 
 ### 7.1 Monitorización (Prometheus)
 
@@ -227,6 +301,7 @@ Todas las rutas salvo `/health` exigen `API_TOKEN` si está definido (sección 2
 | `bot_last_healthcheck_timestamp_seconds` | Último health-check correcto con el bot en pausa |
 | `bot_equity_usd`, `bot_daily_pnl_usd`, `bot_open_positions` | Cuenta del broker (en cada iteración activa y en cada health-check en pausa) |
 | `bot_orders_total`, `bot_errors_total`, `bot_iterations_total` | Contadores |
+| `bot_shadow_*` | Estrategia en sombra (sección 5.2) |
 
 Con el bot **en pausa** no se opera: solo se hace un **health-check de solo lectura** (modo, cuenta y
 posiciones; nunca órdenes ni cancelaciones) cada `PAUSED_HEALTHCHECK_SECONDS` segundos (por defecto
@@ -267,6 +342,13 @@ groups:
         for: 5m
         labels: {severity: critical}
         annotations: {summary: "Bot activo sin una iteración de trading correcta en 15 min"}
+      # En modo diario la iteración de trading es una al día: usa ~26 h en vez de 15 min.
+      - alert: BotDiarioSinOperar
+        expr: bot_enabled == 1 and time() - bot_last_success_timestamp_seconds > 93600
+        labels: {severity: warning}
+      - alert: SombraSinEjecutar
+        expr: time() - bot_shadow_last_run_timestamp_seconds > 93600
+        labels: {severity: warning}
 ```
 
 ## 8. Gestión del proyecto

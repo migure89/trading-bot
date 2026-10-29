@@ -34,9 +34,17 @@ def ohlcv() -> pd.DataFrame:
 
 
 @pytest.fixture
-def store(tmp_path, monkeypatch) -> SettingsStore:
+def daily_store(tmp_path, monkeypatch) -> SettingsStore:
+    """BD nueva con la configuración por defecto (barras diarias + sombra "blend")."""
     monkeypatch.delenv("CONFIRM_LIVE_TRADING", raising=False)
     return SettingsStore(tmp_path / "settings.db")
+
+
+@pytest.fixture
+def store(daily_store) -> SettingsStore:
+    """Configuración intradía (1Hour, sin sombra) que usan los tests del bucle por iteración."""
+    daily_store.update({"timeframe": "1Hour", "lookback_days": 30, "shadow_strategy": "off"})
+    return daily_store
 
 
 @pytest.fixture
