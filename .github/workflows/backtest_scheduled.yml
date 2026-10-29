@@ -72,7 +72,7 @@ jobs:
             echo
             echo 'Para aplicar el ganador (solo los aplicables; se reevalúan los criterios): descarga el artefacto y ejecuta `python -m optimization.optimizer --apply-report optimization.json` junto al bot.'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: optimization-results
