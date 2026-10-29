@@ -14,13 +14,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import time
 from datetime import UTC, datetime, timedelta
 
 from config.settings import LiveTradingNotConfirmed, SettingsStore, resolve_data_provider
 from core.registry import resolve
 from core.schedule import DEFAULT_DAILY_RUN_TIME, DailyGate, completed_daily_bars, effective_lookback
+from core.shutdown import GracefulShutdown, ShutdownRequested
 from data.base import is_crypto
 from data.factory import DataProviderRegistry
 from execution.base import CANCELED, FILLED, PARTIAL, REJECTED, BaseBroker
@@ -67,6 +67,7 @@ class TradingBot:
         self._clock = clock
         self._last_healthcheck: float | None = None  # monotonic del último health-check en pausa
         self.running = True
+        self.shutdown = GracefulShutdown()
         self._paused: bool | None = None           # para registrar la pausa solo al cambiar
         self._failures = 0                          # fallos consecutivos del broker (backoff)
         self._last_error: tuple[str, str] | None = None
@@ -106,6 +107,12 @@ class TradingBot:
 
         Las órdenes rechazadas o canceladas sin ejecutar no se registran como trades.
         """
+        # Envío + espera + registro sin interrupción por la primera señal (acotado por timeouts).
+        with self.shutdown.critical():
+            return self._execute(symbol, side, qty, ref_price, cfg, broker, entry_price)
+
+    def _execute(self, symbol: str, side: str, qty: float, ref_price: float, cfg: dict,
+                 broker: BaseBroker, entry_price: float | None) -> str:
         order = broker.market_order(symbol, qty, side)
         fill = broker.wait_fill(order)
         order_id = str(getattr(order, "id", ""))
@@ -269,20 +276,30 @@ class TradingBot:
             return interval
         return int(min(max(interval, 5) * 2 ** (self._failures - 1), max(BACKOFF_MAX_SEC, interval)))
 
+    def stop(self) -> None:
+        self.running = False
+        self.shutdown.request()
+
     def run(self) -> None:
-        signal.signal(signal.SIGTERM, lambda *_: setattr(self, "running", False))
-        while self.running:
-            try:
-                self.iteration()
-            except Exception:
-                exporter.ERRORS.inc()
-                log.exception("error en iteración")
-            interval = self.next_delay(int(self.store.get("loop_interval_sec", 60)))
-            for _ in range(interval):
-                if not self.running:
+        """Bucle principal. SIGTERM/SIGINT lo paran en pocos segundos (ver ``core.shutdown``)."""
+        installed = self.shutdown.install()
+        try:
+            while self.running and not self.shutdown.requested:
+                try:
+                    self.iteration()
+                except Exception:
+                    exporter.ERRORS.inc()
+                    log.exception("error en iteración")
+                interval = self.next_delay(int(self.store.get("loop_interval_sec", 60)))
+                if self.shutdown.wait(interval):
                     break
-                time.sleep(1)
-        log.info("bot detenido")
+        except ShutdownRequested as exc:
+            log.info("llamada en curso interrumpida por la parada", extra={"signal": str(exc)})
+        finally:
+            if installed:
+                self.shutdown.restore()
+            self.running = False
+            log.info("bot detenido")
 
 
 def main() -> None:
@@ -301,13 +318,15 @@ def main() -> None:
         snapshot = ShadowRunner(store, DataProviderRegistry()).run(cfg)
         print(json.dumps(snapshot, default=str, ensure_ascii=False))
         return
-    if not args.no_metrics:
-        exporter.start_exporter()
-    bot = TradingBot(SettingsStore(), DataProviderRegistry(), BrokerRegistry())
-    if args.once:
-        print(json.dumps(bot.iteration(), default=str))
-    else:
-        bot.run()
+    metrics = None if args.no_metrics else exporter.start_exporter()
+    try:
+        bot = TradingBot(SettingsStore(), DataProviderRegistry(), BrokerRegistry())
+        if args.once:
+            print(json.dumps(bot.iteration(), default=str))
+        else:
+            bot.run()
+    finally:
+        exporter.stop_exporter(metrics)
 
 
 if __name__ == "__main__":

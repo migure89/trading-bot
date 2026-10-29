@@ -351,6 +351,34 @@ groups:
         labels: {severity: warning}
 ```
 
+### 7.2 Timeouts, reintentos y parada limpia
+
+alpaca-py no pone `timeout` a sus peticiones: si Alpaca deja de contestar con la conexión abierta
+(`Read timed out (read timeout=None)`), la llamada se quedaba colgada y el bot no respondía ni a
+SIGTERM. Ahora todos los clientes de Alpaca (`TradingClient` de órdenes y calendario y los de datos
+de acciones y cripto) usan una sesión HTTP con límites (`core/alpaca_http.py`):
+
+| Variable | Defecto | Uso |
+|---|---|---|
+| `ALPACA_HTTP_CONNECT_TIMEOUT` | 5 | Segundos para abrir la conexión |
+| `ALPACA_HTTP_TIMEOUT` | 20 | Segundos de espera de respuesta (lectura) |
+| `ALPACA_HTTP_RETRIES` | 3 | Reintentos de lecturas idempotentes (GET) ante timeout, corte, 429 o 5xx |
+| `ALPACA_HTTP_BACKOFF` | 0.5 | Backoff exponencial entre reintentos (`backoff × 2ⁿ` s, máx. 10 s; respeta `Retry-After`) |
+| `ALPACA_ORDER_SUBMIT_ATTEMPTS` | 2 | Envíos como máximo de una orden (1-5) |
+
+- **Órdenes sin duplicados:** los POST/DELETE solo se reintentan si falló la *conexión* (la petición no
+  salió). Cada orden lleva un `client_order_id` propio (`tb-…`); si el envío falla de forma ambigua
+  (timeout, corte, 429/5xx) el bot consulta la orden por ese id: si existe la usa, si Alpaca responde
+  404 la reenvía con el **mismo** id (Alpaca rechaza ids repetidos) y, si no se puede consultar, lanza
+  `OrderStatusUnknown` y **no** reenvía (hay que revisar la cuenta). Los rechazos claros (4xx) no se
+  reintentan. Se desactiva el reintento interno de alpaca-py, que también repetía POST con 429/504.
+- **Parada limpia:** SIGTERM o SIGINT (Ctrl+C, `docker stop`) paran el bucle en pocos segundos aunque
+  haya una llamada en curso, y el exporter de métricas se cierra y libera el puerto 9100. Si llega
+  durante el envío y registro de una orden, el bot espera a que termine (acotado por los timeouts y
+  `ORDER_FILL_TIMEOUT`) para no dejar una orden sin registrar; una segunda señal corta incluso eso.
+- **IBKR:** todas sus llamadas ya tenían límite (`IBKR_CONNECT_TIMEOUT`, `IBKR_REQUEST_TIMEOUT`); ahora,
+  además, la corrutina se cancela si vence el timeout para que no quede viva en el hilo de ib_async.
+
 ## 8. Gestión del proyecto
 
 Las issues y épicas están en [`GITHUB_PROJECT_SETUP.md`](GITHUB_PROJECT_SETUP.md), con un script

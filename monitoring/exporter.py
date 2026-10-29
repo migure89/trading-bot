@@ -28,9 +28,20 @@ PAUSED = Gauge("bot_paused", "1 si el bot está en pausa (kill switch)")
 INFO = Gauge("bot_info", "Broker y modo configurados (valor siempre 1)", ["broker", "mode"])
 
 
-def start_exporter(port: int | None = None, addr: str | None = None) -> None:
-    start_http_server(int(port or os.getenv("METRICS_PORT", 9100)),
-                      addr=addr or os.getenv("METRICS_ADDR", "127.0.0.1"))
+def start_exporter(port: int | None = None, addr: str | None = None):
+    """Arranca el servidor HTTP de métricas en un hilo y devuelve ``(servidor, hilo)``."""
+    return start_http_server(int(port or os.getenv("METRICS_PORT", 9100)),
+                             addr=addr or os.getenv("METRICS_ADDR", "127.0.0.1"))
+
+
+def stop_exporter(handle, timeout: float = 5.0) -> None:
+    """Para el servidor de métricas (libera el puerto). Acepta ``None``."""
+    if not handle:
+        return
+    server, thread = handle
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout)
 
 
 def update_config(cfg: dict) -> None:

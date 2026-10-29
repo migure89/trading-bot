@@ -176,7 +176,13 @@ class IBKRConnection:
             return res
 
         fut = asyncio.run_coroutine_threadsafe(call(), self._loop)
-        return fut.result(timeout or self.config.request_timeout)
+        try:
+            return fut.result(timeout or self.config.request_timeout)
+        except BaseException:
+            # Timeout (o parada por señal): cancela la corrutina para que no siga viva
+            # en el hilo de ib_async.
+            fut.cancel()
+            raise
 
     @property
     def ib(self):

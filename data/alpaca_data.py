@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 
+from core.alpaca_http import configure_client
 from data.base import (
     NY,
     OHLCV_COLUMNS,
@@ -86,7 +87,7 @@ class AlpacaDataProvider:
                 raise DataProviderError(
                     "Los datos de acciones de Alpaca requieren APCA_API_KEY_ID y APCA_API_SECRET_KEY "
                     "(los de cripto son públicos)")
-            self._stock = StockHistoricalDataClient(self.api_key, self.secret_key)
+            self._stock = configure_client(StockHistoricalDataClient(self.api_key, self.secret_key))
         return self._stock
 
     @property
@@ -95,7 +96,7 @@ class AlpacaDataProvider:
             from alpaca.data.historical import CryptoHistoricalDataClient
 
             # Los datos cripto no requieren claves, pero se usan si existen.
-            self._crypto = CryptoHistoricalDataClient(self.api_key, self.secret_key)
+            self._crypto = configure_client(CryptoHistoricalDataClient(self.api_key, self.secret_key))
         return self._crypto
 
     @property
@@ -104,7 +105,7 @@ class AlpacaDataProvider:
             from alpaca.trading.client import TradingClient
 
             # El calendario es el mismo en paper y live; solo lectura.
-            self._calendar = TradingClient(self.api_key, self.secret_key, paper=True)
+            self._calendar = configure_client(TradingClient(self.api_key, self.secret_key, paper=True))
         return self._calendar
 
     def sessions(self, start: datetime, end: datetime) -> dict:
