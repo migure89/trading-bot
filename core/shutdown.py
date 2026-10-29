@@ -55,6 +55,10 @@ class GracefulShutdown:
         return self._event.wait(max(0.0, seconds))
 
     # ---- señales -------------------------------------------------------
+    @property
+    def installed(self) -> bool:
+        return bool(self._previous)
+
     def install(self, signals=STOP_SIGNALS) -> bool:
         """Instala los manejadores (solo posible en el hilo principal). Devuelve si se instalaron."""
         if threading.current_thread() is not threading.main_thread():

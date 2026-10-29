@@ -408,3 +408,23 @@ def test_ibkr_call_timeout_cancels_coroutine():
         conn.run(hung, timeout=0.2)
     assert time.monotonic() - t0 < 2
     assert cancelled.wait(2)
+
+
+def test_main_sigterm_during_startup_exits_cleanly(monkeypatch):
+    """Un SIGTERM antes de que arranque el bucle (exporter arrancando) no mata el proceso."""
+    import main as main_mod
+
+    stopped = []
+
+    def fake_start():
+        os.kill(os.getpid(), signal.SIGTERM)
+        return "handle"
+
+    monkeypatch.setattr(main_mod.exporter, "start_exporter", fake_start)
+    monkeypatch.setattr(main_mod.exporter, "stop_exporter", stopped.append)
+    monkeypatch.setattr(main_mod, "TradingBot", MagicMock(side_effect=AssertionError("no debe construirse")))
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+    before = signal.getsignal(signal.SIGTERM)
+    main_mod.main()
+    assert stopped == ["handle"]
+    assert signal.getsignal(signal.SIGTERM) is before

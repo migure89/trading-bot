@@ -54,7 +54,8 @@ class TradingBot:
 
     def __init__(self, store: SettingsStore, provider, broker,
                  healthcheck_interval: int | None = None, clock=time.monotonic,
-                 now=None, shadow: ShadowRunner | None = None) -> None:
+                 now=None, shadow: ShadowRunner | None = None,
+                 shutdown: GracefulShutdown | None = None) -> None:
         self.store, self.provider, self.broker = store, provider, broker
         self._now = now or (lambda: datetime.now(UTC))
         # La sombra solo recibe el store y los datos: no tiene forma de llegar al broker.
@@ -67,7 +68,7 @@ class TradingBot:
         self._clock = clock
         self._last_healthcheck: float | None = None  # monotonic del último health-check en pausa
         self.running = True
-        self.shutdown = GracefulShutdown()
+        self.shutdown = shutdown or GracefulShutdown()
         self._paused: bool | None = None           # para registrar la pausa solo al cambiar
         self._failures = 0                          # fallos consecutivos del broker (backoff)
         self._last_error: tuple[str, str] | None = None
@@ -282,7 +283,8 @@ class TradingBot:
 
     def run(self) -> None:
         """Bucle principal. SIGTERM/SIGINT lo paran en pocos segundos (ver ``core.shutdown``)."""
-        installed = self.shutdown.install()
+        # Si main() ya instaló los manejadores, no los reinstalamos ni los restauramos aquí.
+        installed = not self.shutdown.installed and self.shutdown.install()
         try:
             while self.running and not self.shutdown.requested:
                 try:
@@ -318,15 +320,25 @@ def main() -> None:
         snapshot = ShadowRunner(store, DataProviderRegistry()).run(cfg)
         print(json.dumps(snapshot, default=str, ensure_ascii=False))
         return
-    metrics = None if args.no_metrics else exporter.start_exporter()
+    # Los manejadores se instalan antes de arrancar el exporter: una señal durante el
+    # arranque (p. ej. un SIGTERM temprano de systemd/docker) también produce una salida limpia.
+    shutdown = GracefulShutdown()
+    installed = not args.once and shutdown.install()
+    metrics = None
     try:
-        bot = TradingBot(SettingsStore(), DataProviderRegistry(), BrokerRegistry())
+        with shutdown.critical():  # una señal aquí se aplaza hasta tener el handle para cerrarlo
+            metrics = None if args.no_metrics else exporter.start_exporter()
+        bot = TradingBot(SettingsStore(), DataProviderRegistry(), BrokerRegistry(), shutdown=shutdown)
         if args.once:
             print(json.dumps(bot.iteration(), default=str))
         else:
             bot.run()
+    except ShutdownRequested as exc:
+        log.info("parada solicitada durante el arranque", extra={"signal": str(exc)})
     finally:
         exporter.stop_exporter(metrics)
+        if installed:
+            shutdown.restore()
 
 
 if __name__ == "__main__":
