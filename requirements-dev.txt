@@ -2,5 +2,5 @@
 -r requirements.txt
 pytest>=8.0,<10
 httpx2>=2.16,<3           # cliente de starlette.testclient (sustituye a httpx, obsoleto)
-ruff>=0.6,<1
-pyyaml>=6,<7              # validación de los workflows en los tests
+ruff>=0.13,<1             # 0.13+: no aplica la regla obsoleta UP038 (isinstance con X | Y)
+pyyaml>=6.0.1,<7          # validación de los workflows en los tests (6.0 no compila en Python 3.12)
