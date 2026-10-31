@@ -192,6 +192,7 @@ def test_bot_restores_shadow_metrics_on_start(daily_store, daily_provider, fake_
     assert get("bot_shadow_last_run_timestamp_seconds", {"strategy": "lev_trend"}) == THU_10ET.timestamp()
     assert get("bot_shadow_universe_size", {"strategy": "dyn_momentum"}) == fake_scanner.n_symbols
     assert get("bot_shadow_gross_exposure", {"strategy": "lev_rotation"}) is not None
+    assert get("bot_shadow_universe_size", {"strategy": "blend"}) == len(daily_store.load()["shadow_symbols"])
 
 
 # ---- bot: reintento solo de las que fallan ----------------------------------------------

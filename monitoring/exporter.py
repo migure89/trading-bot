@@ -124,4 +124,5 @@ def restore_shadow(snapshots) -> None:
         universe = snapshot.get("universe") or {}
         size = universe.get("size") if isinstance(universe, dict) else None
         SHADOW_UNIVERSE.labels(snapshot.get("strategy", "")).set(
-            size if size is not None else len(snapshot.get("symbols") or []))
+            size if size is not None
+            else len(snapshot.get("symbols") or snapshot.get("weights") or []))
