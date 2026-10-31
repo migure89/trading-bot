@@ -165,3 +165,35 @@ def ibkr_conn(fake_ib, monkeypatch):
     yield conn
     if conn._loop is not None:
         conn._loop.call_soon_threadsafe(conn._loop.stop)
+
+
+# ---------------------------------------------------------------------------
+# Universo dinámico (dyn_momentum): escáner falso, sin red ni claves de Alpaca
+# ---------------------------------------------------------------------------
+class FakeScanner:
+    """Imita ``core.universe.UniverseScanner.closes``: cierres diarios sintéticos de 15 valores."""
+
+    def __init__(self, n_symbols: int = 15, days: int = 300, fail: Exception | None = None):
+        self.n_symbols, self.days, self.fail, self.calls = n_symbols, days, fail, 0
+
+    def closes(self, now):
+        self.calls += 1
+        if self.fail is not None:
+            raise self.fail
+        rng = np.random.default_rng(1)
+        end = pd.Timestamp(now).tz_convert("America/New_York").normalize().tz_localize(None)
+        idx = pd.bdate_range(end=end - pd.Timedelta(days=1), periods=self.days)
+        idx = pd.DatetimeIndex(idx).tz_localize("America/New_York").tz_convert("UTC") + pd.Timedelta(hours=4)
+        drift = np.linspace(-0.001, 0.002, self.n_symbols)
+        rets = rng.normal(drift, 0.015, (self.days, self.n_symbols))
+        panel = pd.DataFrame(100 * np.exp(np.cumsum(rets, axis=0)), index=idx,
+                             columns=[f"S{i:02d}" for i in range(self.n_symbols)])
+        return panel, {"week": "test", "scanned_at": None, "size": self.n_symbols,
+                       "candidates": self.n_symbols, "liquid": self.n_symbols, "dropped_jumps": []}
+
+
+@pytest.fixture(autouse=True)
+def fake_scanner(monkeypatch):
+    scanner = FakeScanner()
+    monkeypatch.setattr("shadow.runner._default_scanner", lambda: scanner)
+    return scanner

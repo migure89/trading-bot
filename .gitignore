@@ -9,3 +9,5 @@ config/settings.db
 *.db-journal
 *.log
 .DS_Store
+cache/
+config/cache/

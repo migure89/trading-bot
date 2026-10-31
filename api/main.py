@@ -20,6 +20,7 @@ from config.settings import (
     SettingsStore,
     normalize_symbols,
     resolve_data_provider,
+    shadow_strategy_list,
 )
 from execution.base import BaseBroker, BrokerConnectionError
 from execution.factory import BrokerRegistry
@@ -170,7 +171,11 @@ class ConfigUpdate(StrictModel):
     regular_hours_only: StrictBool | None = None
     strategy_params: StrategyParamsUpdate | None = None
     daily_run_time: str | None = Field(None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
-    shadow_strategy: Literal["off", "blend", "trend_sma", "rsi2"] | None = None
+    shadow_strategy: Literal["off", "blend", "trend_sma", "rsi2", "lev_trend", "lev_rotation",
+                             "dyn_momentum"] | None = None
+    # Lista de estrategias en sombra (vacía = sombra desactivada); los nombres los valida el store.
+    shadow_strategies: list[str] | None = Field(None, max_length=10)
+    shadow_universe: Literal["fixed", "dynamic"] | None = None
     shadow_symbols: list[str] | None = Field(None, min_length=1, max_length=100)
     # Confirmación explícita para cambiar de broker estando (o pasando) a live.
     confirm_live: bool = False
@@ -286,12 +291,25 @@ def close_position(body: ClosePositionRequest, store: SettingsStore = Depends(ge
 
 @app.get("/shadow")
 def shadow(limit: int = 30, store: SettingsStore = Depends(get_store)):
-    """Señales de la estrategia en sombra (solo lectura; la sombra nunca envía órdenes)."""
-    history = store.shadow_history(max(1, min(int(limit), 365)))
+    """Señales de las estrategias en sombra (solo lectura; la sombra nunca envía órdenes).
+
+    ``strategy``/``latest``/``history`` se refieren a la primera estrategia (compatibilidad);
+    ``by_strategy`` trae el último snapshot y el historial de cada una.
+    """
+    limit = max(1, min(int(limit), 365))
     cfg = store.load()
-    return {"strategy": cfg.get("shadow_strategy", "off"), "symbols": cfg.get("shadow_symbols", []),
+    names = shadow_strategy_list(cfg)
+    by_strategy = {}
+    for name in names:
+        hist = store.shadow_history(limit, strategy=name)
+        by_strategy[name] = {"latest": hist[0] if hist else None, "history": hist}
+    primary = names[0] if names else "off"
+    history = by_strategy[primary]["history"] if names else store.shadow_history(limit)
+    return {"strategy": primary, "strategies": names, "symbols": cfg.get("shadow_symbols", []),
+            "universe": cfg.get("shadow_universe", "dynamic"),
             "daily_run_time": cfg.get("daily_run_time"), "orders": False,
-            "latest": history[0] if history else None, "history": history}
+            "latest": history[0] if history else None, "history": history,
+            "by_strategy": by_strategy}
 
 
 @app.get("/metrics")

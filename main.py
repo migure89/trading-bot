@@ -6,8 +6,9 @@ descarga datos, calcula la señal y ejecuta órdenes dimensionadas por riesgo.
 
 Con ``timeframe=1Day`` (por defecto) opera **una vez por día hábil** a ``daily_run_time``
 (09:35 ET): señal con la última barra diaria cerrada y orden de mercado en la apertura.
-La estrategia en sombra (``shadow_strategy``) se calcula también una vez al día, esté el
-bot activo o en pausa, y **nunca** envía órdenes (``shadow.runner`` no recibe broker).
+Las estrategias en sombra (``shadow_strategies``) se calculan también una vez al día, después
+de operar y esté el bot activo o en pausa, y **nunca** envían órdenes (``shadow.runner`` no
+recibe broker). Si alguna falla se reintenta solo esa, como mucho ``SHADOW_MAX_ATTEMPTS`` veces.
 """
 from __future__ import annotations
 
@@ -17,7 +18,12 @@ import os
 import time
 from datetime import UTC, datetime, timedelta
 
-from config.settings import LiveTradingNotConfirmed, SettingsStore, resolve_data_provider
+from config.settings import (
+    LiveTradingNotConfirmed,
+    SettingsStore,
+    resolve_data_provider,
+    shadow_strategy_list,
+)
 from core.registry import resolve
 from core.schedule import DEFAULT_DAILY_RUN_TIME, DailyGate, completed_daily_bars, effective_lookback
 from core.shutdown import GracefulShutdown, ShutdownRequested
@@ -35,6 +41,7 @@ log = get_logger("bot")
 
 BACKOFF_MAX_SEC = 300  # tope del backoff exponencial ante fallos del broker
 SHADOW_RETRY_SEC = 900  # reintento de la sombra tras un error (sin datos, calendario…)
+SHADOW_MAX_ATTEMPTS = 3  # intentos por día de las estrategias en sombra que fallan
 PAUSED_HEALTHCHECK_DEFAULT_SEC = 300  # health-check de solo lectura con el bot en pausa (0 = desactivado)
 
 
@@ -63,6 +70,8 @@ class TradingBot:
         self._shadow_gate = DailyGate()
         self._trade_gate = DailyGate(until_close=True)
         self._shadow_retry_at: datetime | None = None
+        self._shadow_pending: list[str] | None = None  # estrategias que faltan hoy (None = ninguna en curso)
+        self._shadow_attempts = 0
         self.healthcheck_interval = (paused_healthcheck_seconds() if healthcheck_interval is None
                                      else max(0, int(healthcheck_interval)))
         self._clock = clock
@@ -142,33 +151,68 @@ class TradingBot:
         exporter.ITERATIONS.inc()
         exporter.LAST_ITERATION.set_to_current_time()
         exporter.update_config(cfg)          # bot_enabled / bot_live_mode / bot_info / bot_paused
-        shadow = self.maybe_run_shadow(cfg)  # solo señales; corre también en pausa
-        out = self._iteration(cfg)
+        # Primero se opera y después la sombra (solo señales; corre también en pausa): el escáner
+        # del universo dinámico no puede retrasar las órdenes del día.
+        try:
+            out = self._iteration(cfg)
+        except ShutdownRequested:
+            raise
+        except Exception:
+            self.maybe_run_shadow(cfg)
+            raise
+        shadow = self.maybe_run_shadow(cfg)
         if shadow:
             out["shadow"] = shadow
         return out
 
+    def _finish_shadow(self, now: datetime) -> None:
+        self._shadow_retry_at, self._shadow_pending, self._shadow_attempts = None, None, 0
+        self._shadow_gate.mark(now)
+
     def maybe_run_shadow(self, cfg: dict) -> str | None:
-        """Estrategia en sombra una vez al día. Nunca lanza excepciones ni toca el broker."""
-        if cfg.get("shadow_strategy", "off") == "off":
+        """Estrategias en sombra una vez al día. Nunca lanza excepciones ni toca el broker.
+
+        Devuelve ``"ok"``, ``"partial"`` (alguna estrategia falló y se reintentará),
+        ``"error"`` o ``None`` si no tocaba.
+        """
+        names = shadow_strategy_list(cfg)
+        if not names:
             return None
         now = self._now()
         if self._shadow_retry_at is not None and now < self._shadow_retry_at:
             return None
         try:
-            provider = resolve(self.provider, resolve_data_provider(cfg))
-            if not self._shadow_gate.due(now, cfg.get("daily_run_time", DEFAULT_DAILY_RUN_TIME), provider):
-                return None
-            self.shadow.run(cfg, now)
+            if self._shadow_pending is None:
+                provider = resolve(self.provider, resolve_data_provider(cfg))
+                run_time = cfg.get("daily_run_time", DEFAULT_DAILY_RUN_TIME)
+                if not self._shadow_gate.due(now, run_time, provider):
+                    return None
+                self._shadow_pending, self._shadow_attempts = list(names), 0
+            todo = [n for n in self._shadow_pending if n in names]
+            self._shadow_attempts += 1
+            result = self.shadow.run(cfg, now, only=todo) if todo else {"errors": {}}
         except Exception as exc:  # noqa: BLE001 - la sombra no puede tumbar el bot
-            exporter.SHADOW_ERRORS.inc()
-            self._shadow_retry_at = now + timedelta(seconds=SHADOW_RETRY_SEC)
-            log.warning("error en la estrategia en sombra", extra={"error": str(exc) or type(exc).__name__,
-                                                                    "retry_in_sec": SHADOW_RETRY_SEC})
-            return "error"
-        self._shadow_retry_at = None
-        self._shadow_gate.mark(now)
-        return "ok"
+            exporter.SHADOW_ERRORS.labels("all").inc()
+            failed, error = self._shadow_pending or names, str(exc) or type(exc).__name__
+            status = "error"
+        else:
+            failed = list(result.get("errors", {}))
+            error = result.get("errors")
+            status = "partial" if failed else "ok"
+        if not failed:
+            self._finish_shadow(now)
+            return status
+        if self._shadow_attempts >= SHADOW_MAX_ATTEMPTS:
+            log.error("estrategias en sombra sin calcular hoy", extra={"failed": failed, "error": error,
+                                                                         "attempts": self._shadow_attempts})
+            self._finish_shadow(now)
+            return status
+        self._shadow_pending = failed
+        self._shadow_retry_at = now + timedelta(seconds=SHADOW_RETRY_SEC)
+        log.warning("error en la sombra; se reintentará", extra={"failed": failed, "error": error,
+                                                                 "retry_in_sec": SHADOW_RETRY_SEC,
+                                                                 "attempt": self._shadow_attempts})
+        return status
 
     def _iteration(self, cfg: dict) -> dict:
         if not cfg["bot_enabled"]:
@@ -310,15 +354,17 @@ def main() -> None:
     ap.add_argument("--once", action="store_true", help="ejecuta una sola iteración")
     ap.add_argument("--no-metrics", action="store_true", help="no arranca el exporter Prometheus")
     ap.add_argument("--shadow-once", action="store_true",
-                    help="calcula ahora la estrategia en sombra y sale (sin broker ni órdenes)")
+                    help="calcula ahora las estrategias en sombra y sale (sin broker ni órdenes)")
     args = ap.parse_args()
     if args.shadow_once:
         store = SettingsStore()
         cfg = store.load()
-        if cfg.get("shadow_strategy", "off") == "off":
-            raise SystemExit("shadow_strategy=off")
-        snapshot = ShadowRunner(store, DataProviderRegistry()).run(cfg)
-        print(json.dumps(snapshot, default=str, ensure_ascii=False))
+        if not shadow_strategy_list(cfg):
+            raise SystemExit("shadow_strategies vacío (sombra desactivada)")
+        result = ShadowRunner(store, DataProviderRegistry()).run(cfg)
+        print(json.dumps(result, default=str, ensure_ascii=False))
+        if result["errors"]:
+            raise SystemExit(f"estrategias con error: {', '.join(result['errors'])}")
         return
     # Los manejadores se instalan antes de arrancar el exporter: una señal durante el
     # arranque (p. ej. un SIGTERM temprano de systemd/docker) también produce una salida limpia.
