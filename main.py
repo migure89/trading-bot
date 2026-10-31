@@ -325,10 +325,24 @@ class TradingBot:
         self.running = False
         self.shutdown.request()
 
+    def restore_shadow_metrics(self) -> None:
+        """Publica en Prometheus la última sombra guardada de cada estrategia.
+
+        Sin esto, tras un reinicio las métricas ``bot_shadow_*`` quedarían vacías hasta la
+        siguiente ejecución diaria (p. ej. todo el fin de semana).
+        """
+        try:
+            names = shadow_strategy_list(self.store.load())
+            latest = [h[0] for h in (self.store.shadow_history(1, name) for name in names) if h]
+            exporter.restore_shadow(latest)
+        except Exception:
+            log.exception("no se pudieron restaurar las métricas de la sombra")
+
     def run(self) -> None:
         """Bucle principal. SIGTERM/SIGINT lo paran en pocos segundos (ver ``core.shutdown``)."""
         # Si main() ya instaló los manejadores, no los reinstalamos ni los restauramos aquí.
         installed = not self.shutdown.installed and self.shutdown.install()
+        self.restore_shadow_metrics()
         try:
             while self.running and not self.shutdown.requested:
                 try:

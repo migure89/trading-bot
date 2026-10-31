@@ -181,6 +181,19 @@ def test_exporter_keeps_strategies_apart():
     assert get("bot_shadow_target_weight", {"strategy": "t_b", "symbol": "X"}) == 1.0
 
 
+def test_bot_restores_shadow_metrics_on_start(daily_store, daily_provider, fake_scanner):
+    ShadowRunner(daily_store, daily_provider).run(daily_store.load(), now=THU_10ET)
+    exporter.SHADOW_LAST_RUN.labels("lev_trend").set(0)
+    exporter.SHADOW_UNIVERSE.labels("dyn_momentum").set(0)
+    bot = TradingBot(daily_store, daily_provider, MagicMock(), healthcheck_interval=0)
+    bot.running = False                                    # solo el arranque, sin iteraciones
+    bot.run()
+    get = REGISTRY.get_sample_value
+    assert get("bot_shadow_last_run_timestamp_seconds", {"strategy": "lev_trend"}) == THU_10ET.timestamp()
+    assert get("bot_shadow_universe_size", {"strategy": "dyn_momentum"}) == fake_scanner.n_symbols
+    assert get("bot_shadow_gross_exposure", {"strategy": "lev_rotation"}) is not None
+
+
 # ---- bot: reintento solo de las que fallan ----------------------------------------------
 def test_bot_retries_only_failed_strategies(daily_store, daily_provider):
     scanner = FakeScanner(fail=TimeoutError("lento"))

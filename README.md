@@ -277,7 +277,8 @@ Dónde verlas:
 - **Prometheus:** `bot_shadow_target_weight{strategy,symbol}`, `bot_shadow_gross_exposure{strategy}`,
   `bot_shadow_regime_bull{strategy}`, `bot_shadow_last_run_timestamp_seconds{strategy}`,
   `bot_shadow_universe_size{strategy}` y `bot_shadow_errors_total{strategy}` (`strategy="all"` si falla
-  la ejecución entera).
+  la ejecución entera). Al arrancar, el bot republica la última sombra guardada de cada estrategia, así
+  que las métricas no quedan vacías tras un reinicio (p. ej. en fin de semana).
 - **Logs JSON:** `"msg": "señales en sombra (sin órdenes)"` con el snapshot en el campo `shadow`.
 - **A mano:** `python main.py --shadow-once` (calcula todas, imprime el JSON y sale con error si alguna
   falla; solo datos, sin broker). Para el primer escaneo se puede dar más margen:

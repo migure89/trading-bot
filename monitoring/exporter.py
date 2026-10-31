@@ -6,6 +6,7 @@ Escucha en ``METRICS_ADDR:METRICS_PORT`` (por defecto ``127.0.0.1:9100``). En Do
 from __future__ import annotations
 
 import os
+from datetime import datetime
 
 from prometheus_client import Counter, Gauge, start_http_server
 
@@ -102,4 +103,25 @@ def update_shadow(snapshot: dict) -> None:
     _shadow_symbols[strategy] = set(weights)
     SHADOW_EXPOSURE.labels(strategy).set(snapshot.get("gross_exposure", 0))
     SHADOW_REGIME.labels(strategy).set(int(bool(snapshot.get("regime_bull"))))
-    SHADOW_LAST_RUN.labels(strategy).set_to_current_time()
+    run_at = _epoch(snapshot.get("run_at"))
+    if run_at is None:
+        SHADOW_LAST_RUN.labels(strategy).set_to_current_time()
+    else:
+        SHADOW_LAST_RUN.labels(strategy).set(run_at)
+
+
+def _epoch(value) -> float | None:
+    try:
+        return datetime.fromisoformat(str(value)).timestamp() if value else None
+    except ValueError:
+        return None
+
+
+def restore_shadow(snapshots) -> None:
+    """Republica los últimos snapshots guardados (p. ej. al arrancar el bot)."""
+    for snapshot in snapshots:
+        update_shadow(snapshot)
+        universe = snapshot.get("universe") or {}
+        size = universe.get("size") if isinstance(universe, dict) else None
+        SHADOW_UNIVERSE.labels(snapshot.get("strategy", "")).set(
+            size if size is not None else len(snapshot.get("symbols") or []))
