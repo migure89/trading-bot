@@ -20,6 +20,7 @@ se lanza ``ScanBudgetExceeded`` y el bot reintenta más tarde desde donde se que
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -56,6 +57,24 @@ EXCLUDE_NAME_RE = re.compile(
 EXCLUDE_TICKERS = frozenset({"TQQQ", "SQQQ", "SOXL", "SOXS", "UPRO", "SPXU", "TECL", "TNA", "TZA", "UVXY",
                              "SVXY", "VXX", "VIXY", "VIXM", "UVIX", "SVIX", "FNGU", "FNGD", "LABU", "LABD",
                              "BITX", "NVDL", "TSLL", "MSTU", "MSTX", "CONL", "QLD", "SSO", "TMF", "TMV"})
+# Liquidez, letras del Tesoro y bonos a corto plazo: casi no se mueven, así que un momentum dividido
+# por la volatilidad los pondría siempre arriba (p. ej. SGOV). Lista configurable con
+# SHADOW_EXCLUDE_TICKERS (se suma a esta) + heurística por nombre (solo en fondos/ETFs).
+CASH_LIKE_TICKERS = frozenset({
+    "SGOV", "BIL", "SHV", "SHY", "TFLO", "USFR", "BILS", "ICSH", "JPST", "MINT", "VGSH", "SCHO", "GBIL",
+    "CLIP", "XHLF", "TBIL", "XBIL", "TBLL", "OBIL", "BOXX", "FLOT", "FLRN", "NEAR", "GSY", "VUSB", "PULS",
+    "FTSM", "SPTS", "BSV", "USTB", "SHM", "BILZ", "TBUX", "ULST", "JMST", "XONE", "UTWO", "IBTF",
+    "SUB", "VNLA", "LDUR", "FLTR", "MEAR", "JAAA", "PAAA", "CLOI", "AAA"})
+FUND_NAME_RE = re.compile(r"\b(etf|etn|fund)\b", re.I)
+CASH_NAME_RE = re.compile(
+    r"(\bt-?bills?\b|\bmoney market\b|\bbox etf\b|\bcash management\b"
+    r"|\b(\d+(-\d+)?|one|three|six|twelve)[- ]month (t-?bill|treasury|bill|box)\b"
+    r"|\b0-[1-5] year\b|\b1-3 year\b|\bultra[- ]short\b|\bshort[- ](term|duration|maturity)\b"
+    r"|\bfloating rate\b|\bclo\b)", re.I)
+# Además del patrón, el nombre debe sonar a renta fija (evita p. ej. "Short-Term REIT").
+BOND_NAME_RE = re.compile(
+    r"(bond|treasury|t-?bill|\bbill\b|income|muni|tax-exempt|fixed|government|maturity|corporate"
+    r"|duration|\bnote\b|credit|loan|high yield|tips|inflation|money market|\bclo\b|\bbox\b)", re.I)
 INVALID_SYMBOL_RE = re.compile(r"invalid symbol: ([A-Z0-9.\-/]+)")
 
 
@@ -85,18 +104,41 @@ def default_cache_dir() -> Path:
     return default_db_path().resolve().parent / "cache" / "universe"
 
 
-def excluded_asset(symbol: str, name: str | None) -> bool:
-    """True si es un ETF/ETN apalancado, inverso o de volatilidad (no entra en el universo)."""
-    return symbol in EXCLUDE_TICKERS or bool(EXCLUDE_NAME_RE.search(name or ""))
+def extra_excluded_from_env() -> frozenset[str]:
+    """Tickers adicionales a excluir (``SHADOW_EXCLUDE_TICKERS=AAA,BBB``)."""
+    raw = os.getenv("SHADOW_EXCLUDE_TICKERS", "")
+    return frozenset(t.strip().upper() for t in raw.split(",") if t.strip())
+
+
+def cash_like(symbol: str, name: str | None, extra: frozenset[str] = frozenset()) -> bool:
+    """True si es un ETF de liquidez, letras del Tesoro o bonos a corto plazo."""
+    if symbol in CASH_LIKE_TICKERS or symbol in extra:
+        return True
+    name = name or ""
+    return bool(FUND_NAME_RE.search(name) and CASH_NAME_RE.search(name) and BOND_NAME_RE.search(name))
+
+
+def excluded_asset(symbol: str, name: str | None, extra: frozenset[str] | None = None) -> bool:
+    """True si no entra en el universo: ETF/ETN apalancado, inverso, de volatilidad o casi liquidez."""
+    extra = extra_excluded_from_env() if extra is None else extra
+    return (symbol in EXCLUDE_TICKERS or bool(EXCLUDE_NAME_RE.search(name or ""))
+            or cash_like(symbol, name, extra))
+
+
+def filters_signature() -> str:
+    """Huella de los filtros de activos: si cambian, se invalidan las cachés de activos y universo."""
+    raw = "|".join([EXCLUDE_NAME_RE.pattern, CASH_NAME_RE.pattern, FUND_NAME_RE.pattern, BOND_NAME_RE.pattern,
+                    ",".join(sorted(EXCLUDE_TICKERS | CASH_LIKE_TICKERS | extra_excluded_from_env()))])
+    return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
 def filter_assets(raw: list[dict]) -> list[str]:
-    out = set()
+    out, extra = set(), extra_excluded_from_env()
     for a in raw:
         sym = str(a.get("symbol") or "")
         if (a.get("status") == "active" and a.get("tradable") and a.get("exchange") in VALID_EXCHANGES
                 and a.get("class", a.get("asset_class", "us_equity")) == "us_equity"
-                and TICKER_RE.match(sym) and not excluded_asset(sym, a.get("name"))):
+                and TICKER_RE.match(sym) and not excluded_asset(sym, a.get("name"), extra)):
             out.add(sym)
     return sorted(out)
 
@@ -207,7 +249,8 @@ class UniverseScanner:
     # ---- 1) activos ------------------------------------------------------------------
     def assets(self, today: date) -> list[str]:
         cached = self._read_json("assets.json")
-        if cached and (today - date.fromisoformat(cached["fetched"])).days < ASSETS_MAX_AGE_DAYS:
+        if (cached and cached.get("filters") == filters_signature()
+                and (today - date.fromisoformat(cached["fetched"])).days < ASSETS_MAX_AGE_DAYS):
             return cached["symbols"]
         self._check_budget("activos")
         self._pace()
@@ -215,7 +258,8 @@ class UniverseScanner:
         symbols = filter_assets(list(raw or []))
         if not symbols:
             raise RuntimeError("Alpaca no devolvió activos negociables")
-        self._write_json("assets.json", {"fetched": today.isoformat(), "symbols": symbols})
+        self._write_json("assets.json", {"fetched": today.isoformat(), "symbols": symbols,
+                                         "filters": filters_signature()})
         return symbols
 
     # ---- barras por lotes ---------------------------------------------------------------
@@ -251,14 +295,17 @@ class UniverseScanner:
         today = now.astimezone(NY).date()
         week = iso_week(today)
         cached = self._read_json("universe.json")
-        if cached and cached.get("week") == week and cached.get("symbols"):
+        signature = filters_signature()
+        if (cached and cached.get("week") == week and cached.get("symbols")
+                and cached.get("filters") == signature):
             return cached
         symbols = self.assets(today)
         end = now.astimezone(UTC) - timedelta(minutes=16)      # sin restricción SIP de 15 min
         start = end - timedelta(days=LIQUIDITY_DAYS)
         progress = self._read_json("scan_progress.json")
-        if not progress or progress.get("week") != week or progress.get("n_symbols") != len(symbols):
-            progress = {"week": week, "n_symbols": len(symbols), "done": [], "rows": {}}
+        if (not progress or progress.get("week") != week or progress.get("n_symbols") != len(symbols)
+                or progress.get("filters") != signature):
+            progress = {"week": week, "n_symbols": len(symbols), "filters": signature, "done": [], "rows": {}}
         batches = [symbols[i:i + BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
         for i, batch in enumerate(batches):
             if i in progress["done"]:
@@ -274,7 +321,8 @@ class UniverseScanner:
         top = rank_universe(table, self.top)
         if not top:
             raise RuntimeError("ningún valor supera los filtros de liquidez")
-        out = {"week": week, "scanned_at": now.astimezone(UTC).isoformat(timespec="seconds"),
+        out = {"week": week, "filters": signature,
+               "scanned_at": now.astimezone(UTC).isoformat(timespec="seconds"),
                "symbols": top, "adv": {s: round(float(table.at[s, "adv"]), 0) for s in top},
                "candidates": len(symbols), "liquid": int(((table["adv"] > MIN_ADV)
                                                          & (table["last_close"] > MIN_PRICE)).sum())}
@@ -329,5 +377,5 @@ def scanner_from_env() -> UniverseScanner:
     return UniverseScanner()
 
 
-__all__ = ["ScanBudgetExceeded", "UniverseScanner", "excluded_asset", "filter_assets", "has_jumps",
-           "liquidity_table", "rank_universe", "scanner_from_env"]
+__all__ = ["ScanBudgetExceeded", "UniverseScanner", "cash_like", "excluded_asset", "filter_assets",
+           "has_jumps", "liquidity_table", "rank_universe", "scanner_from_env"]

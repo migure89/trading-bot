@@ -34,6 +34,10 @@ class StrategySpec:
     universe: str = "shadow"
     symbols: tuple[str, ...] = ()     # símbolos a descargar con universe="own"
     tradable: tuple[str, ...] = ()    # columnas con peso (vacío = todos los símbolos del panel)
+    params_fn: Callable[[], dict] | None = None   # parámetros efectivos (p. ej. leídos del entorno)
+
+    def current_params(self) -> dict:
+        return self.params_fn() if self.params_fn else self.params
 
 
 TRADING_STRATEGY = "ema_rsi"
@@ -55,8 +59,10 @@ STRATEGIES: dict[str, StrategySpec] = {
                                  lev_rotation.target_weights, dict(lev_rotation.PARAMS), universe="own",
                                  symbols=lev_rotation.SYMBOLS, tradable=lev_rotation.TRADABLE),
     "dyn_momentum": StrategySpec("dyn_momentum", "portfolio",
-                                 "Top 10 por momentum ajustado por riesgo de los 100 más líquidos (semanal)",
-                                 dyn_momentum.target_weights, dict(dyn_momentum.PARAMS), universe="dynamic"),
+                                 "Top 10 por momentum ajustado por riesgo de los 100 más líquidos, "
+                                 "sin casi-liquidez (vol ≥ 15 %, semanal)",
+                                 dyn_momentum.target_weights, dict(dyn_momentum.PARAMS), universe="dynamic",
+                                 params_fn=dyn_momentum.params),
 }
 
 SHADOW_STRATEGIES = tuple(n for n, s in STRATEGIES.items() if s.kind == "portfolio")
