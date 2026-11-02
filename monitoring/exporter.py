@@ -6,6 +6,7 @@ Escucha en ``METRICS_ADDR:METRICS_PORT`` (por defecto ``127.0.0.1:9100``). En Do
 from __future__ import annotations
 
 import os
+from datetime import datetime
 
 from prometheus_client import Counter, Gauge, start_http_server
 
@@ -73,21 +74,55 @@ def update_account(account: dict, n_positions: int, enabled: bool | None = None,
         LIVE_MODE.set(int(mode == "live"))
 
 
-# ---- estrategia en sombra (solo señales; nunca órdenes) -------------------------
+# ---- estrategias en sombra (solo señales; nunca órdenes) ------------------------
 SHADOW_WEIGHT = Gauge("bot_shadow_target_weight",
                       "Peso objetivo de la estrategia en sombra (no se opera)", ["strategy", "symbol"])
 SHADOW_EXPOSURE = Gauge("bot_shadow_gross_exposure", "Exposición total objetivo de la sombra", ["strategy"])
-SHADOW_REGIME = Gauge("bot_shadow_regime_bull", "1 si SPY > SMA200 en la última barra diaria")
-SHADOW_LAST_RUN = Gauge("bot_shadow_last_run_timestamp_seconds", "Momento (epoch) de la última sombra")
-SHADOW_ERRORS = Counter("bot_shadow_errors_total", "Errores al calcular la estrategia en sombra")
+SHADOW_REGIME = Gauge("bot_shadow_regime_bull", "1 si SPY > SMA200 en la última barra diaria", ["strategy"])
+SHADOW_LAST_RUN = Gauge("bot_shadow_last_run_timestamp_seconds", "Momento (epoch) de la última sombra",
+                        ["strategy"])
+SHADOW_ERRORS = Counter("bot_shadow_errors_total",
+                        "Errores al calcular la sombra (strategy=all: fallo de toda la ejecución)",
+                        ["strategy"])
+SHADOW_UNIVERSE = Gauge("bot_shadow_universe_size", "Símbolos en el universo de la estrategia en sombra",
+                        ["strategy"])
+_shadow_symbols: dict[str, set[str]] = {}
 
 
 def update_shadow(snapshot: dict) -> None:
-    SHADOW_WEIGHT.clear()
-    SHADOW_EXPOSURE.clear()
+    """Publica los pesos de una estrategia sin tocar los de las demás."""
     strategy = snapshot.get("strategy", "")
-    for symbol, weight in (snapshot.get("weights") or {}).items():
+    weights = snapshot.get("weights") or {}
+    for symbol in _shadow_symbols.get(strategy, set()) - set(weights):
+        try:
+            SHADOW_WEIGHT.remove(strategy, symbol)
+        except KeyError:
+            pass
+    for symbol, weight in weights.items():
         SHADOW_WEIGHT.labels(strategy, symbol).set(weight)
+    _shadow_symbols[strategy] = set(weights)
     SHADOW_EXPOSURE.labels(strategy).set(snapshot.get("gross_exposure", 0))
-    SHADOW_REGIME.set(int(bool(snapshot.get("regime_bull"))))
-    SHADOW_LAST_RUN.set_to_current_time()
+    SHADOW_REGIME.labels(strategy).set(int(bool(snapshot.get("regime_bull"))))
+    run_at = _epoch(snapshot.get("run_at"))
+    if run_at is None:
+        SHADOW_LAST_RUN.labels(strategy).set_to_current_time()
+    else:
+        SHADOW_LAST_RUN.labels(strategy).set(run_at)
+
+
+def _epoch(value) -> float | None:
+    try:
+        return datetime.fromisoformat(str(value)).timestamp() if value else None
+    except ValueError:
+        return None
+
+
+def restore_shadow(snapshots) -> None:
+    """Republica los últimos snapshots guardados (p. ej. al arrancar el bot)."""
+    for snapshot in snapshots:
+        update_shadow(snapshot)
+        universe = snapshot.get("universe") or {}
+        size = universe.get("size") if isinstance(universe, dict) else None
+        SHADOW_UNIVERSE.labels(snapshot.get("strategy", "")).set(
+            size if size is not None
+            else len(snapshot.get("symbols") or snapshot.get("weights") or []))

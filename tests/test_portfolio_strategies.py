@@ -24,8 +24,11 @@ def _bull(index):
 
 # ---- registro ---------------------------------------------------------------------
 def test_registry():
-    assert set(registry.STRATEGIES) == {"ema_rsi", "trend_sma", "rsi2", "blend"}
-    assert registry.SHADOW_STRATEGIES == ("trend_sma", "rsi2", "blend")
+    assert set(registry.STRATEGIES) == {"ema_rsi", "trend_sma", "rsi2", "blend", "lev_trend",
+                                        "lev_rotation", "dyn_momentum"}
+    assert registry.SHADOW_STRATEGIES == ("trend_sma", "rsi2", "blend", "lev_trend", "lev_rotation",
+                                          "dyn_momentum")
+    assert registry.DEFAULT_SHADOW_STRATEGIES == ("blend", "lev_trend", "lev_rotation", "dyn_momentum")
     assert registry.SHADOW_CHOICES[0] == "off"
     traders = [n for n, s in registry.STRATEGIES.items() if s.trades]
     assert traders == [registry.TRADING_STRATEGY] == ["ema_rsi"]

@@ -25,10 +25,10 @@ API **FastAPI**, dashboard **Streamlit** y monitorización con logs JSON + **Pro
 | Carpeta | Contenido |
 |---|---|
 | `config/` | `schema.sql` y `settings.py` (store SQLite; `settings.db` se crea al arrancar) |
-| `core/` | Registro genérico para elegir implementaciones en caliente |
+| `core/` | Registro de implementaciones, calendario diario, HTTP de Alpaca y escáner de universo (`universe.py`) |
 | `connectors/` | `ibkr.py`: conexión `ib_async` (hilo propio, paper/live por puerto, validación de cuenta) |
 | `data/` | Interfaz `DataProvider` y barras OHLCV de Alpaca (`alpaca_data.py`) e IBKR (`ibkr_data.py`) |
-| `strategies/` | Indicadores (EMA, SMA, RSI, MACD, Bollinger, ATR) y estrategia EMA+RSI |
+| `strategies/` | Indicadores, estrategia EMA+RSI (la que opera) y estrategias de cartera en sombra |
 | `execution/` | Interfaz `BaseBroker` (sizing por ATR común), `AlpacaBroker`, `IBKRBroker` y `BrokerRegistry` |
 | `backtesting/` | Motor vectorizado y métricas (Sharpe, Profit Factor, Max DD, Win Rate) |
 | `optimization/` | Optuna + feedback loop con validación fuera de muestra |
@@ -106,7 +106,7 @@ tests y lint; Dependabot (`.github/dependabot.yml`) propone las actualizaciones.
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt         # o requirements.txt si solo vas a ejecutar
 python main.py --once                       # una iteración de prueba
-python main.py --shadow-once                # calcula y registra las señales en sombra (sin broker)
+python main.py --shadow-once                # calcula y registra todas las estrategias en sombra (sin broker)
 python main.py                              # bucle continuo
 uvicorn api.main:app --reload               # API
 API_URL=http://localhost:8000 streamlit run dashboard/app.py
@@ -119,7 +119,8 @@ pytest -q && ruff check .
 Claves en la tabla `settings`: `mode`, `broker` (`alpaca` | `ibkr`), `data_provider`
 (`auto` = el del broker, `alpaca` o `ibkr`), `bot_enabled`, `symbols` (p.ej. `["AAPL","BTC/USD"]`),
 `risk_pct`, `timeframe`, `loop_interval_sec`, `lookback_days`, `regular_hours_only`, `strategy_params`,
-`daily_run_time`, `shadow_strategy` y `shadow_symbols` (secciones 4.2 y 5.2).
+`daily_run_time`, `shadow_strategies`, `shadow_strategy`, `shadow_universe` y `shadow_symbols`
+(secciones 4.2 y 5.2).
 El bot las relee en **cada iteración**; si cambia `mode`, se recrea el `TradingClient` de Alpaca con
 `paper=True/False` o se reconecta a IBKR en el puerto paper/live; si cambia `broker`, la siguiente
 iteración ya opera con el nuevo broker. Las BDs antiguas se migran solas al arrancar.
@@ -197,7 +198,8 @@ mayúsculas y sin duplicados), `lookback_days` > 3650, `risk_pct` fuera de (0, 1
 `regular_hours_only` que no sea booleano y `strategy_params`
 con claves desconocidas, tipos erróneos o reglas incoherentes (`ema_fast < ema_slow`,
 `rsi_oversold < rsi_overbought`), `daily_run_time` que no sea `HH:MM`, `shadow_strategy` fuera de
-`off|blend|trend_sma|rsi2` y `shadow_symbols` inválidos. El kill switch se cambia con `/toggle-bot`, no con `/config`.
+`off|blend|trend_sma|rsi2|lev_trend|lev_rotation|dyn_momentum`, `shadow_strategies` con nombres
+desconocidos, `shadow_universe` distinto de `fixed|dynamic` y `shadow_symbols` inválidos. El kill switch se cambia con `/toggle-bot`, no con `/config`.
 
 ### 5.2 Estrategias en sombra (solo señales, **nunca órdenes**)
 
@@ -210,25 +212,86 @@ con claves desconocidas, tipos erróneos o reglas incoherentes (`ema_fast < ema_
 | `rsi2` | Entra con RSI(2) < 10 y cierre > SMA200 (régimen alcista); sale al cerrar sobre la SMA5; máx. 4 posiciones de 1/4 (las nuevas por menor RSI2) |
 | `blend` | 50 % `trend_sma` + 50 % `rsi2` (por defecto) |
 
-`shadow_strategy` (`blend` por defecto; `trend_sma`, `rsi2` u `off`) elige cuál se ejecuta **en sombra**
-sobre `shadow_symbols` (por defecto SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, GOOGL, META, JPM, XOM, KO).
-Una vez por día hábil a partir de `daily_run_time` (aunque el bot esté **en pausa**) el bot descarga barras
-diarias ajustadas, calcula los **pesos objetivo** con la última barra cerrada y los registra. Garantía en
-código: `shadow/runner.py` no importa nada de `execution` ni recibe un broker (lo comprueban los tests),
-así que no puede enviar órdenes aunque el bot esté activo. Si falla (p.ej. sin datos) se reintenta en
-15 min y no afecta al bot.
+Y tres estrategias **agresivas**, solo para seguimiento (`trades=False`; nunca operan), salidas de la
+investigación "duplicar en un mes" (2018-2026, barras diarias ajustadas, costes incluidos). Ninguna
+lo consigue de forma fiable y todas tienen caídas enormes:
+
+| Estrategia | Reglas | Investigación |
+|---|---|---|
+| `lev_trend` | 100 % TQQQ mientras QQQ > SMA200; si no, liquidez | CAGR 28,4 %, máx. caída −58,5 %; fuera de muestra CAGR 47,4 % |
+| `lev_rotation` | Cada viernes, con SPY > SMA200, 100 % en el mejor retorno a 63 sesiones entre TQQQ, SOXL, UPRO, TECL y TNA; si no, liquidez | CAGR 21,5 %, máx. caída −65,1 %; P(> +25 % en 21 sesiones) 10,9 % |
+| `dyn_momentum` | Cada viernes, top 10 a peso igual por momentum ajustado por riesgo (retorno t−126…t−21 / volatilidad de 63 sesiones) entre los **100 valores más líquidos**, sin ETFs de liquidez/letras y con volatilidad ≥ 15 % | CAGR 14,4 %, máx. caída −47,0 % (antes del filtro: 12,7 % / −45,8 %) |
+
+Referencia: comprar y mantener QQQ, CAGR 19,0 % y máx. caída −35,0 %. Son datos históricos, no una
+promesa: el seguimiento en sombra sirve para ver cómo se comportan en vivo antes de plantearse nada.
+
+`shadow_strategies` es la lista que se ejecuta (por defecto `["blend", "lev_trend", "lev_rotation",
+"dyn_momentum"]`; vacía = sombra desactivada). `shadow_strategy` se mantiene por compatibilidad: siempre
+es la primera de la lista (u `off`) y, si se cambia sola, sustituye la lista por esa estrategia. La
+migración `2026-10-shadow-agresiva` añade las tres agresivas a las BDs existentes (respetando
+`shadow_strategy=off`) sin tocar `bot_enabled`, `mode`, el broker ni la estrategia que opera.
+
+Universos:
+
+- `trend_sma`, `rsi2` y `blend` usan `shadow_symbols` (por defecto SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN,
+  GOOGL, META, JPM, XOM, KO).
+- `lev_trend` y `lev_rotation` descargan siempre sus propios símbolos (QQQ, SPY, TQQQ, SOXL, UPRO, TECL,
+  TNA), estén o no en `shadow_symbols`.
+- `dyn_momentum` con `shadow_universe=dynamic` (por defecto) usa el escáner `core/universe.py`: lista
+  cruda de activos de Alpaca (`GET /v2/assets`; el modelo de alpaca-py falla con exchanges nuevos como
+  TXSE), sin OTC ni ETFs/ETNs apalancados, inversos o de volatilidad, ni ETFs de liquidez, letras del
+  Tesoro o bonos a corto plazo (lista fija —SGOV, BIL, SHV, SHY, TFLO, USFR, JPST, MINT…— más una
+  heurística por nombre: "T-Bill", "0-3 Month Treasury", "Money Market", "Ultra Short", "Short-Term …
+  Bond", "Floating Rate"…); barras diarias SIP en lotes de 200
+  símbolos; precio > 5 $ y volumen medio de 20 sesiones > 20 M$; se descartan las series con saltos
+  diarios > 5x; los 100 de mayor volumen en dólares. El universo se recalcula una vez por semana y el
+  historial una vez al día; todo queda en caché en disco (`SHADOW_CACHE_DIR`, por defecto
+  `<carpeta de settings.db>/cache/universe`, fuera del repositorio). Con `shadow_universe=fixed` usa
+  `shadow_symbols`.
+- Además, `dyn_momentum` solo puntúa valores con volatilidad anualizada (63 sesiones) ≥ `SHADOW_MIN_VOL`
+  (15 %): como el momentum se divide por la volatilidad, un casi-efectivo con volatilidad ~0 (SGOV)
+  tendría la mejor puntuación sin aportar rentabilidad. Si cambian los filtros (o
+  `SHADOW_EXCLUDE_TICKERS`), la caché del universo se invalida y se reescanea.
+
+| Variable | Defecto | Uso |
+|---|---|---|
+| `SHADOW_MIN_VOL` | 0.15 | Volatilidad anualizada mínima (fracción) para entrar en el ranking de `dyn_momentum`; `0` la desactiva |
+| `SHADOW_EXCLUDE_TICKERS` | — | Tickers extra a excluir del universo dinámico, separados por comas (p. ej. `BRK.B,XYZ`) |
+| `SHADOW_SCAN_BUDGET_SEC` | 90 | Tiempo máximo del escáner por intento (se comprueba entre lotes). Si se agota, el progreso queda en caché y se continúa en el siguiente reintento |
+| `SHADOW_CACHE_DIR` | `<carpeta de settings.db>/cache/universe` | Caché de activos, progreso del escaneo, universo semanal e historial |
+
+El escáner usa los timeouts y reintentos de `core/alpaca_http.py` (sección 7.2) y espacia las peticiones
+(~0,35 s) para no rozar el límite de Alpaca. El escaneo semanal completo (~12 000 activos, ~60 lotes)
+tarda ~45 s; los días siguientes solo se descarga el historial de los 100 (unos segundos).
+
+Una vez por día hábil a partir de `daily_run_time` (aunque el bot esté **en pausa**), **después** de la
+iteración de trading (el escáner no puede retrasar las órdenes), el bot descarga barras diarias
+ajustadas, calcula los **pesos objetivo** de cada estrategia con la última barra cerrada y los registra.
+Los cierres se descargan una vez por ejecución y se comparten entre estrategias. Garantía en código:
+`shadow/runner.py` no importa nada de `execution` ni recibe un broker (lo comprueban los tests), así que
+no puede enviar órdenes aunque el bot esté activo. Cada estrategia es independiente: si una falla (sin
+datos, escáner sin tiempo…) se registra el error, sube `bot_shadow_errors_total{strategy}`, las demás se
+calculan igual y solo las que fallaron se reintentan cada 15 min, hasta 3 intentos al día.
 
 Dónde verlas:
 
-- **API:** `GET /shadow?limit=30` → `{"strategy", "symbols", "daily_run_time", "orders": false, "latest", "history"}`.
-  `latest` incluye `as_of` (última barra cerrada), `regime_bull`, `weights`, `gross_exposure`,
+- **API:** `GET /shadow?limit=30` → `{"strategy", "strategies", "symbols", "universe", "daily_run_time",
+  "orders": false, "latest", "history", "by_strategy"}`. `strategy`/`latest`/`history` son los de la
+  primera estrategia (compatibilidad) y `by_strategy` trae `{"latest", "history"}` de cada una. Cada
+  snapshot incluye `as_of` (última barra cerrada), `regime_bull`, `weights`, `gross_exposure`,
   `changes` (entrar/salir/ajustar respecto al día anterior), `components` (pesos de cada mitad de la
-  mezcla), `params`, `errors` y `orders_sent: 0`. Se guardan en la tabla `shadow_signals`.
-- **Dashboard:** pestaña **"Sombra (sin órdenes)"**.
+  mezcla), `params`, `universe` (origen, tamaño y fecha del escaneo en `dyn_momentum`), `errors`,
+  `trades: false` y `orders_sent: 0`. Se guardan en la tabla `shadow_signals` (una fila por estrategia).
+- **Dashboard:** pestaña **"Sombra (sin órdenes)"**, con una subpestaña por estrategia.
 - **Prometheus:** `bot_shadow_target_weight{strategy,symbol}`, `bot_shadow_gross_exposure{strategy}`,
-  `bot_shadow_regime_bull`, `bot_shadow_last_run_timestamp_seconds`, `bot_shadow_errors_total`.
+  `bot_shadow_regime_bull{strategy}`, `bot_shadow_last_run_timestamp_seconds{strategy}`,
+  `bot_shadow_universe_size{strategy}` y `bot_shadow_errors_total{strategy}` (`strategy="all"` si falla
+  la ejecución entera). Al arrancar, el bot republica la última sombra guardada de cada estrategia, así
+  que las métricas no quedan vacías tras un reinicio (p. ej. en fin de semana).
 - **Logs JSON:** `"msg": "señales en sombra (sin órdenes)"` con el snapshot en el campo `shadow`.
-- **A mano:** `python main.py --shadow-once` (imprime el JSON; solo datos, sin broker).
+- **A mano:** `python main.py --shadow-once` (calcula todas, imprime el JSON y sale con error si alguna
+  falla; solo datos, sin broker). Para el primer escaneo se puede dar más margen:
+  `SHADOW_SCAN_BUDGET_SEC=600 python main.py --shadow-once`.
 
 `backtesting/portfolio.py` (`backtest_strategy(bars, "blend")`) hace el backtest de estas estrategias de
 cartera con la misma convención (señal al cierre, ejecución en la apertura siguiente, coste por lado).
@@ -286,7 +349,7 @@ Todas las rutas salvo `/health` exigen `API_TOKEN` si está definido (sección 2
 | POST | `/cancel-orders` | Cancela todas las órdenes abiertas del broker activo |
 | POST | `/close-position` | Cierra una posición concreta |
 | GET | `/metrics` | Métricas, operaciones e historial de optimización |
-| GET | `/shadow` | Señales y pesos objetivo de la estrategia en sombra (último + historial; nunca órdenes) |
+| GET | `/shadow` | Señales y pesos objetivo de las estrategias en sombra (último + historial de cada una; nunca órdenes) |
 
 ### 7.1 Monitorización (Prometheus)
 
@@ -301,7 +364,7 @@ Todas las rutas salvo `/health` exigen `API_TOKEN` si está definido (sección 2
 | `bot_last_healthcheck_timestamp_seconds` | Último health-check correcto con el bot en pausa |
 | `bot_equity_usd`, `bot_daily_pnl_usd`, `bot_open_positions` | Cuenta del broker (en cada iteración activa y en cada health-check en pausa) |
 | `bot_orders_total`, `bot_errors_total`, `bot_iterations_total` | Contadores |
-| `bot_shadow_*` | Estrategia en sombra (sección 5.2) |
+| `bot_shadow_*{strategy}` | Estrategias en sombra, una serie por estrategia (sección 5.2) |
 
 Con el bot **en pausa** no se opera: solo se hace un **health-check de solo lectura** (modo, cuenta y
 posiciones; nunca órdenes ni cancelaciones) cada `PAUSED_HEALTHCHECK_SECONDS` segundos (por defecto
@@ -346,7 +409,7 @@ groups:
       - alert: BotDiarioSinOperar
         expr: bot_enabled == 1 and time() - bot_last_success_timestamp_seconds > 93600
         labels: {severity: warning}
-      - alert: SombraSinEjecutar
+      - alert: SombraSinEjecutar   # una alerta por estrategia (etiqueta strategy)
         expr: time() - bot_shadow_last_run_timestamp_seconds > 93600
         labels: {severity: warning}
 ```
