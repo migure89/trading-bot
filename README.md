@@ -220,7 +220,7 @@ lo consigue de forma fiable y todas tienen caídas enormes:
 |---|---|---|
 | `lev_trend` | 100 % TQQQ mientras QQQ > SMA200; si no, liquidez | CAGR 28,4 %, máx. caída −58,5 %; fuera de muestra CAGR 47,4 % |
 | `lev_rotation` | Cada viernes, con SPY > SMA200, 100 % en el mejor retorno a 63 sesiones entre TQQQ, SOXL, UPRO, TECL y TNA; si no, liquidez | CAGR 21,5 %, máx. caída −65,1 %; P(> +25 % en 21 sesiones) 10,9 % |
-| `dyn_momentum` | Cada viernes, top 10 a peso igual por momentum ajustado por riesgo (retorno t−126…t−21 / volatilidad de 63 sesiones) entre los **100 valores más líquidos** | CAGR 12,7 %, máx. caída −45,8 % |
+| `dyn_momentum` | Cada viernes, top 10 a peso igual por momentum ajustado por riesgo (retorno t−126…t−21 / volatilidad de 63 sesiones) entre los **100 valores más líquidos**, sin ETFs de liquidez/letras y con volatilidad ≥ 15 % | CAGR 14,4 %, máx. caída −47,0 % (antes del filtro: 12,7 % / −45,8 %) |
 
 Referencia: comprar y mantener QQQ, CAGR 19,0 % y máx. caída −35,0 %. Son datos históricos, no una
 promesa: el seguimiento en sombra sirve para ver cómo se comportan en vivo antes de plantearse nada.
@@ -239,15 +239,24 @@ Universos:
   TNA), estén o no en `shadow_symbols`.
 - `dyn_momentum` con `shadow_universe=dynamic` (por defecto) usa el escáner `core/universe.py`: lista
   cruda de activos de Alpaca (`GET /v2/assets`; el modelo de alpaca-py falla con exchanges nuevos como
-  TXSE), sin OTC ni ETFs/ETNs apalancados, inversos o de volatilidad; barras diarias SIP en lotes de 200
+  TXSE), sin OTC ni ETFs/ETNs apalancados, inversos o de volatilidad, ni ETFs de liquidez, letras del
+  Tesoro o bonos a corto plazo (lista fija —SGOV, BIL, SHV, SHY, TFLO, USFR, JPST, MINT…— más una
+  heurística por nombre: "T-Bill", "0-3 Month Treasury", "Money Market", "Ultra Short", "Short-Term …
+  Bond", "Floating Rate"…); barras diarias SIP en lotes de 200
   símbolos; precio > 5 $ y volumen medio de 20 sesiones > 20 M$; se descartan las series con saltos
   diarios > 5x; los 100 de mayor volumen en dólares. El universo se recalcula una vez por semana y el
   historial una vez al día; todo queda en caché en disco (`SHADOW_CACHE_DIR`, por defecto
   `<carpeta de settings.db>/cache/universe`, fuera del repositorio). Con `shadow_universe=fixed` usa
   `shadow_symbols`.
+- Además, `dyn_momentum` solo puntúa valores con volatilidad anualizada (63 sesiones) ≥ `SHADOW_MIN_VOL`
+  (15 %): como el momentum se divide por la volatilidad, un casi-efectivo con volatilidad ~0 (SGOV)
+  tendría la mejor puntuación sin aportar rentabilidad. Si cambian los filtros (o
+  `SHADOW_EXCLUDE_TICKERS`), la caché del universo se invalida y se reescanea.
 
 | Variable | Defecto | Uso |
 |---|---|---|
+| `SHADOW_MIN_VOL` | 0.15 | Volatilidad anualizada mínima (fracción) para entrar en el ranking de `dyn_momentum`; `0` la desactiva |
+| `SHADOW_EXCLUDE_TICKERS` | — | Tickers extra a excluir del universo dinámico, separados por comas (p. ej. `BRK.B,XYZ`) |
 | `SHADOW_SCAN_BUDGET_SEC` | 90 | Tiempo máximo del escáner por intento (se comprueba entre lotes). Si se agota, el progreso queda en caché y se continúa en el siguiente reintento |
 | `SHADOW_CACHE_DIR` | `<carpeta de settings.db>/cache/universe` | Caché de activos, progreso del escaneo, universo semanal e historial |
 

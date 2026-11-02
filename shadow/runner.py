@@ -176,7 +176,7 @@ class ShadowRunner:
             "gross_exposure": round(float(last.sum()), 6),
             "changes": _changes(prev, last),
             "components": components,
-            "params": spec.params,
+            "params": spec.current_params(),
             "symbols": list(spec.symbols) if spec.universe == "own" else [],
             "universe": universe,
             "errors": errors,
