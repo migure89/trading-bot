@@ -109,7 +109,8 @@ def test_migration_old_hourly_db_to_daily(tmp_path, caplog):
     assert cfg["shadow_strategy"] == "blend"
     assert "configuración migrada a barras diarias" in caplog.text
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT name FROM migrations").fetchall() == [("2026-10-daily-bars",)]
+        assert conn.execute("SELECT name FROM migrations").fetchall() == [
+            ("2026-10-daily-bars",), ("2026-10-shadow-agresiva",)]
     # Volver a 1Hour a mano se respeta: la migración no se repite al reabrir.
     SettingsStore(path).update({"timeframe": "1Hour", "lookback_days": 30})
     assert SettingsStore(path).load()["timeframe"] == "1Hour"
@@ -137,18 +138,21 @@ def test_shadow_module_has_no_broker():
     mods = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
     mods |= {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     assert not any(m and (m.startswith("execution") or m.startswith("connectors")) for m in mods)
-    assert list(inspect.signature(ShadowRunner).parameters) == ["store", "provider"]
+    assert list(inspect.signature(ShadowRunner).parameters) == ["store", "provider", "scanner"]
 
 
 def test_shadow_runner_records_snapshot(daily_store, daily_provider):
     daily_store.update({"shadow_symbols": ["SPY", "AAPL", "MSFT", "NVDA", "KO"]})
-    snap = ShadowRunner(daily_store, daily_provider).run(daily_store.load(), THU_10ET)
+    result = ShadowRunner(daily_store, daily_provider).run(daily_store.load(), THU_10ET)
+    assert result["orders_sent"] == 0 and result["errors"] == {}
+    assert list(result["strategies"]) == ["blend", "lev_trend", "lev_rotation", "dyn_momentum"]
+    snap = result["strategies"]["blend"]
     assert snap["shadow"] is True and snap["orders_sent"] == 0 and snap["strategy"] == "blend"
     assert snap["as_of"] == "2026-10-28"                       # última barra cerrada
     assert set(snap["weights"]) == {"SPY", "AAPL", "MSFT", "NVDA", "KO"}
     assert sum(snap["weights"].values()) <= 1 + 1e-9
     assert set(snap["components"]) == {"trend_sma", "rsi2"}
-    assert daily_store.shadow_history()[0]["as_of"] == "2026-10-28"
+    assert daily_store.shadow_history(strategy="blend")[0]["as_of"] == "2026-10-28"
     for _, _, kw in daily_provider.get_bars.mock_calls:
         assert kw["regular_hours"] is True
     assert {c.args[1] for c in daily_provider.get_bars.call_args_list} == {"1Day"}
@@ -164,7 +168,7 @@ def test_enabled_bot_with_shadow_sends_no_shadow_orders(daily_store, daily_provi
     broker = AlpacaBroker(client_factory=lambda paper: fake_trading_client)
     out = TradingBot(daily_store, daily_provider, broker, now=lambda: THU_10ET).iteration()
     assert out["shadow"] == "ok" and out["actions"] == {"AAPL": "hold"}
-    assert any(w > 0 for w in daily_store.shadow_history()[0]["weights"].values())
+    assert any(w > 0 for w in daily_store.shadow_history(strategy="blend")[0]["weights"].values())
     fake_trading_client.submit_order.assert_not_called()
     fake_trading_client.close_position.assert_not_called()
 
@@ -176,7 +180,8 @@ def test_paused_bot_runs_shadow_without_touching_broker(daily_store, daily_provi
     assert out["status"] == "paused" and out["shadow"] == "ok"
     assert broker.mock_calls == []
     assert "shadow" not in bot.iteration()                    # una vez al día
-    assert len(daily_store.shadow_history()) == 1
+    assert len(daily_store.shadow_history()) == 4             # una fila por estrategia
+    assert len(daily_store.shadow_history(strategy="lev_trend")) == 1
 
 
 def test_shadow_error_does_not_break_bot(daily_store):
@@ -184,8 +189,11 @@ def test_shadow_error_does_not_break_bot(daily_store):
     provider.get_bars.side_effect = RuntimeError("sin red")
     bot = TradingBot(daily_store, provider, MagicMock(), healthcheck_interval=0, now=lambda: THU_10ET)
     out = bot.iteration()
-    assert out["status"] == "paused" and out["shadow"] == "error"
+    # dyn_momentum (universo dinámico del escáner) sí calcula; las demás fallan sin datos.
+    assert out["status"] == "paused" and out["shadow"] == "partial"
     assert "shadow" not in bot.iteration()                    # reintento en 15 min, no en cada vuelta
+    assert [h["strategy"] for h in daily_store.shadow_history()] == ["dyn_momentum"]
+    assert bot._shadow_pending == ["blend", "lev_trend", "lev_rotation"]
 
 
 def test_shadow_off(daily_store, daily_provider):

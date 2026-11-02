@@ -21,7 +21,13 @@ from core.env import load_env
 from core.schedule import DEFAULT_DAILY_RUN_TIME, MIN_DAILY_LOOKBACK_DAYS, parse_hhmm
 from data.base import TIMEFRAMES
 from monitoring.logger import get_logger
-from strategies.registry import SHADOW_CHOICES
+from strategies.registry import (
+    AGGRESSIVE_SHADOW,
+    DEFAULT_SHADOW_STRATEGIES,
+    SHADOW_CHOICES,
+    SHADOW_STRATEGIES,
+    SHADOW_UNIVERSES,
+)
 
 load_env()  # antes de leer SETTINGS_DB_PATH, CONFIRM_LIVE_TRADING, etc.
 
@@ -34,7 +40,7 @@ log = get_logger("settings")
 
 # Migraciones de datos de la tabla ``settings`` (se aplican una sola vez por BD).
 LEGACY_TIMEFRAME, DAILY_TIMEFRAME = "1Hour", "1Day"
-MIGRATIONS = ("2026-10-daily-bars",)
+MIGRATIONS = ("2026-10-daily-bars", "2026-10-shadow-agresiva")
 
 
 def default_db_path() -> Path:
@@ -52,7 +58,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "loop_interval_sec": 60,
     "lookback_days": 420,         # en 1Day se fuerza un mínimo de 420 (calentamiento de indicadores)
     "daily_run_time": DEFAULT_DAILY_RUN_TIME,  # HH:MM ET: con 1Day se opera una vez al día a esa hora
-    "shadow_strategy": "blend",   # off | blend | trend_sma | rsi2  (solo señales, NUNCA órdenes)
+    # Sombra (solo señales, NUNCA órdenes). ``shadow_strategies`` es la lista que se ejecuta;
+    # ``shadow_strategy`` se mantiene por compatibilidad (= la primera de la lista u "off").
+    "shadow_strategy": "blend",
+    "shadow_strategies": list(DEFAULT_SHADOW_STRATEGIES),
+    "shadow_universe": "dynamic",  # dyn_momentum: dynamic (escáner de liquidez) | fixed (shadow_symbols)
     "shadow_symbols": ["SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META",
                        "JPM", "XOM", "KO"],
     "regular_hours_only": True,   # acciones: solo sesión regular (09:30-16:00 ET) en señales y backtests
@@ -139,6 +149,30 @@ class LiveTradingNotConfirmed(PermissionError):
     """Se intenta pasar a live sin CONFIRM_LIVE_TRADING=true."""
 
 
+def normalize_shadow_strategies(value: Any) -> list[str]:
+    """Lista de estrategias en sombra válida y sin duplicados (vacía = sombra desactivada)."""
+    if isinstance(value, str) or not isinstance(value, list | tuple):
+        raise ValueError("shadow_strategies debe ser una lista")
+    out: list[str] = []
+    for raw in value:
+        name = str(raw).strip().lower()
+        if name not in SHADOW_STRATEGIES:
+            raise ValueError(f"shadow_strategies: estrategia inválida {raw!r} "
+                             f"(admitidas: {', '.join(SHADOW_STRATEGIES)})")
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def shadow_strategy_list(cfg: dict[str, Any]) -> list[str]:
+    """Estrategias en sombra efectivas: ``shadow_strategies`` o, en configs antiguas, ``shadow_strategy``."""
+    names = cfg.get("shadow_strategies")
+    if isinstance(names, list | tuple):
+        return [n for n in names if n in SHADOW_STRATEGIES]
+    legacy = cfg.get("shadow_strategy", "off")
+    return [legacy] if legacy in SHADOW_STRATEGIES else []
+
+
 def live_trading_confirmed() -> bool:
     return os.getenv("CONFIRM_LIVE_TRADING", "false").strip().lower() == "true"
 
@@ -213,6 +247,20 @@ class SettingsStore:
                 log.info("configuración migrada a barras diarias",
                          extra={"migration": name, "before": {k: existing.get(k) for k in changes},
                                 "after": changes})
+        if name == "2026-10-shadow-agresiva" and existing:
+            # Sombra multiestrategia: se conserva la estrategia en sombra actual y se añaden las
+            # agresivas (solo señales). Si la sombra estaba en "off" se respeta. No toca bot_enabled,
+            # mode, broker, symbols ni los parámetros de la estrategia que opera.
+            if "shadow_strategies" in existing:
+                return
+            legacy = existing.get("shadow_strategy", "blend")
+            names = [legacy] if legacy in SHADOW_STRATEGIES else []
+            if legacy != "off":
+                names += [n for n in AGGRESSIVE_SHADOW if n not in names]
+            conn.execute("UPDATE settings SET value=?, updated_at=datetime('now') WHERE key=?",
+                         (json.dumps(names), "shadow_strategies"))
+            log.info("sombra multiestrategia activada", extra={"migration": name,
+                                                              "shadow_strategies": names})
 
     # ---- lectura / escritura -------------------------------------------
     def load(self) -> dict[str, Any]:
@@ -288,6 +336,20 @@ class SettingsStore:
                 raise ValueError(f"shadow_strategy inválido: {shadow} "
                                  f"(admitidos: {', '.join(SHADOW_CHOICES)})")
             changes["shadow_strategy"] = shadow
+        if "shadow_strategies" in changes:
+            changes["shadow_strategies"] = normalize_shadow_strategies(changes["shadow_strategies"])
+            if "shadow_strategy" not in changes:
+                changes["shadow_strategy"] = (changes["shadow_strategies"] or ["off"])[0]
+        elif "shadow_strategy" in changes:
+            # Compatibilidad: fijar una sola estrategia (u "off") sustituye la lista.
+            legacy = changes["shadow_strategy"]
+            changes["shadow_strategies"] = [] if legacy == "off" else [legacy]
+        if "shadow_universe" in changes:
+            universe = str(changes["shadow_universe"]).strip().lower()
+            if universe not in SHADOW_UNIVERSES:
+                raise ValueError(f"shadow_universe inválido: {universe} "
+                                 f"(admitidos: {', '.join(SHADOW_UNIVERSES)})")
+            changes["shadow_universe"] = universe
         if "shadow_symbols" in changes:
             changes["shadow_symbols"] = normalize_symbols(changes["shadow_symbols"])
         if "bot_enabled" in changes and not isinstance(changes["bot_enabled"], bool):
@@ -340,10 +402,14 @@ class SettingsStore:
             conn.execute("INSERT INTO shadow_signals(strategy, as_of, payload) VALUES (?,?,?)",
                          (snapshot["strategy"], snapshot.get("as_of"), json.dumps(snapshot, default=str)))
 
-    def shadow_history(self, limit: int = 30) -> list[dict]:
+    def shadow_history(self, limit: int = 30, strategy: str | None = None) -> list[dict]:
         with self._conn() as conn:
-            rows = conn.execute("SELECT payload FROM shadow_signals ORDER BY id DESC LIMIT ?",
-                                (limit,)).fetchall()
+            if strategy is None:
+                rows = conn.execute("SELECT payload FROM shadow_signals ORDER BY id DESC LIMIT ?",
+                                    (limit,)).fetchall()
+            else:
+                rows = conn.execute("SELECT payload FROM shadow_signals WHERE strategy=? "
+                                    "ORDER BY id DESC LIMIT ?", (strategy, limit)).fetchall()
         return [json.loads(r["payload"]) for r in rows]
 
     def trades(self, limit: int = 500) -> list[dict]:
