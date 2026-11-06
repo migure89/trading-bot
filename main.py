@@ -77,6 +77,7 @@ class TradingBot:
         self._clock = clock
         self._last_healthcheck: float | None = None  # monotonic del último health-check en pausa
         self.running = True
+        self._last_iteration_sec: float = 0.0
         self.shutdown = shutdown or GracefulShutdown()
         self._paused: bool | None = None           # para registrar la pausa solo al cambiar
         self._failures = 0                          # fallos consecutivos del broker (backoff)
@@ -147,12 +148,11 @@ class TradingBot:
         return side
 
     def iteration(self) -> dict:
+        t0 = self._clock()
         cfg = self.store.load()  # hot-reload
         exporter.ITERATIONS.inc()
         exporter.LAST_ITERATION.set_to_current_time()
         exporter.update_config(cfg)          # bot_enabled / bot_live_mode / bot_info / bot_paused
-        # Primero se opera y después la sombra (solo señales; corre también en pausa): el escáner
-        # del universo dinámico no puede retrasar las órdenes del día.
         try:
             out = self._iteration(cfg)
         except ShutdownRequested:
@@ -163,6 +163,9 @@ class TradingBot:
         shadow = self.maybe_run_shadow(cfg)
         if shadow:
             out["shadow"] = shadow
+        elapsed = self._clock() - t0
+        self._last_iteration_sec = elapsed
+        exporter.ITERATION_DURATION.set(elapsed)
         return out
 
     def _finish_shadow(self, now: datetime) -> None:
@@ -224,21 +227,19 @@ class TradingBot:
             if self._healthcheck_due():
                 out["healthcheck"] = self.paused_healthcheck(cfg)
             return out
-        if self._paused:
-            log.info("bot reanudado", extra={"mode": cfg["mode"], "broker": cfg["broker"]})
-        self._paused = False
-        self._last_healthcheck = None
-
         broker, provider = self.active(cfg)
         daily = cfg["timeframe"] == "1Day"
         now = self._now()
         run_time = cfg.get("daily_run_time", DEFAULT_DAILY_RUN_TIME)
         if daily and not self._trade_gate.due(now, run_time, provider):
-            # Diario: fuera de la ventana de ejecución solo un health-check de solo lectura.
             out = {"status": "waiting_daily_run", "broker": cfg["broker"]}
             if self._healthcheck_due():
                 out["healthcheck"] = self.paused_healthcheck(cfg)
             return out
+        if self._paused:
+            log.info("bot reanudado", extra={"mode": cfg["mode"], "broker": cfg["broker"]})
+        self._paused = False
+        self._last_healthcheck = None
         try:
             broker.ensure_mode(cfg["mode"])
             account = broker.account()
@@ -293,7 +294,8 @@ class TradingBot:
     def _broker_failed(self, name: str, error: str, paused: bool = False) -> None:
         exporter.set_broker_connected(name, False, self._last_broker)
         exporter.ERRORS.inc()
-        self._failures += 1
+        if not paused:
+            self._failures += 1
         key = (name, error)
         if key != self._last_error:          # primer fallo o error distinto: un único ERROR/WARNING
             if paused:                       # en pausa no es crítico: sin traceback y como WARNING
@@ -314,12 +316,16 @@ class TradingBot:
     def next_delay(self, interval: int) -> int:
         """Espera hasta la siguiente iteración: backoff exponencial (máx. 5 min) si el broker falla.
 
-        En pausa no hay backoff: el health-check ya limita las llamadas al broker y así el bot
-        reacciona en ``interval`` segundos cuando se reanuda.
+        En pausa y en ``waiting_daily_run`` no hay backoff: el health-check ya limita las
+        llamadas al broker y así el bot reacciona en ``interval`` segundos cuando se reanuda.
+        Solo los fallos de la operativa activa (``_broker_failed(paused=False)``) incrementan
+        ``_failures`` y activan el backoff.
         """
         if not self._failures or self._paused:
             return interval
-        return int(min(max(interval, 5) * 2 ** (self._failures - 1), max(BACKOFF_MAX_SEC, interval)))
+        cap = max(BACKOFF_MAX_SEC, interval)
+        exp = min(self._failures - 1, 10)
+        return min(max(interval, 5) * (2 ** exp), cap)
 
     def stop(self) -> None:
         self.running = False
@@ -340,7 +346,6 @@ class TradingBot:
 
     def run(self) -> None:
         """Bucle principal. SIGTERM/SIGINT lo paran en pocos segundos (ver ``core.shutdown``)."""
-        # Si main() ya instaló los manejadores, no los reinstalamos ni los restauramos aquí.
         installed = not self.shutdown.installed and self.shutdown.install()
         self.restore_shadow_metrics()
         try:
@@ -350,7 +355,16 @@ class TradingBot:
                 except Exception:
                     exporter.ERRORS.inc()
                     log.exception("error en iteración")
-                interval = self.next_delay(int(self.store.get("loop_interval_sec", 60)))
+                if self._last_iteration_sec > 120:
+                    log.warning("iteración lenta",
+                                extra={"elapsed_sec": round(self._last_iteration_sec, 1)})
+                try:
+                    raw = int(self.store.get("loop_interval_sec", 60))
+                    interval = self.next_delay(raw)
+                except Exception as exc:
+                    interval = 60
+                    log.error("error calculando el intervalo",
+                              extra={"error": str(exc) or type(exc).__name__, "fallback_sec": interval})
                 if self.shutdown.wait(interval):
                     break
         except ShutdownRequested as exc:
