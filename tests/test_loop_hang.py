@@ -1,17 +1,15 @@
-"""Regression tests for the main-loop hang after Alpaca read timeouts.
+"""Regression tests for main-loop stall issues after Alpaca read timeouts.
 
-Root cause: when ``bot_enabled=True`` and the daily run is not due
-(``waiting_daily_run``), the iteration sets ``_paused=False`` and resets
-``_last_healthcheck=None`` unconditionally. This causes:
+Two separate bugs are covered:
 
-* ``_failures`` to grow from every healthcheck failure (broker timeout),
-* ``next_delay`` to apply exponential backoff (capped at 300 s) because
-  ``_paused is False``,
-* a healthcheck to run on **every** iteration (the interval is bypassed), and
-* combined with the shadow scan, total iteration cycles of 34-70+ minutes.
+1. **``waiting_daily_run`` backoff and timer reset** (reproducible, verified by
+   these tests): when ``bot_enabled=True`` and the daily run is not due, the
+   old code set ``_paused=False`` and ``_last_healthcheck=None`` too early,
+   causing unnecessary backoff and a healthcheck on every iteration.
 
-These tests pin the exact buggy behavior before the fix so the fix can be
-verified deterministically and future regressions are caught.
+2. **Defensive hardening** of ``next_delay`` (exponent cap, no overflow) and
+   ``run()`` (fallback on delay-calculation errors, iteration-duration gauge
+   and slow-iteration warning) to make any future stall identifiable.
 """
 from __future__ import annotations
 
@@ -68,13 +66,12 @@ def _daily_store_outside_trading(daily_store):
     return daily_store
 
 
-# ---- Core regression: healthcheck failures must not accumulate backoff ------
+# ---- waiting_daily_run: backoff and timer reset bugs -------------------------
 
 def test_waiting_daily_run_healthcheck_failure_no_backoff(daily_store, provider):
     """Healthcheck failures in ``waiting_daily_run`` must not grow ``_failures``
     or trigger exponential backoff.  Before the fix, ``_paused=False`` in this
-    state caused ``next_delay`` to apply up to 300 s of backoff after a single
-    healthcheck failure.
+    state caused ``next_delay`` to apply up to 300 s of backoff.
     """
     store = _daily_store_outside_trading(daily_store)
     broker = TimingOutBroker()
@@ -89,38 +86,39 @@ def test_waiting_daily_run_healthcheck_failure_no_backoff(daily_store, provider)
         result = bot.iteration()
         assert result["status"] == "waiting_daily_run"
         delays.append(bot.next_delay(60))
-        clock.t += 300  # advance clock so healthcheck becomes due again
+        clock.t += 300
 
-    # After fix: no backoff in waiting_daily_run — all delays should be the
-    # base interval, not [60, 120, 240, 300, 300, 300].
     assert all(d == 60 for d in delays), f"expected no backoff, got {delays}"
     assert _metric("bot_broker_connected", broker="alpaca") == 0
 
 
-def test_waiting_daily_run_does_not_reset_healthcheck_timer(daily_store, provider):
-    """In ``waiting_daily_run``, the healthcheck timer must NOT be reset every
-    iteration.  Before the fix, ``_last_healthcheck = None`` at the top of the
-    ``bot_enabled=True`` path forced a healthcheck on every single iteration,
-    amplifying the timeout overhead.
+def test_waiting_daily_run_healthcheck_interval_wall_time(daily_store, provider):
+    """In ``waiting_daily_run``, healthchecks must respect the configured
+    interval across realistic wall-time steps.  Before the fix,
+    ``_last_healthcheck = None`` was reset every iteration, running a
+    healthcheck on every single call regardless of elapsed time.
+
+    Scenario: healthcheck_interval=300 s, iterations at t=0, 60, 120, 180, 240,
+    300, 360.  Only t=0 and t=300 should trigger a healthcheck (2 of 7).
     """
     store = _daily_store_outside_trading(daily_store)
     broker = TimingOutBroker()
-    clock = FakeClock()
+    clock = FakeClock(start=0.0)
     now_et_before_run = datetime(2026, 11, 5, 13, 25, tzinfo=UTC)
 
     bot = TradingBot(store, provider, broker, healthcheck_interval=300, clock=clock,
                      now=lambda: now_et_before_run)
 
-    results = []
-    for _ in range(5):
-        results.append(bot.iteration())
-        clock.t += 60  # advance 60 s (< healthcheck_interval=300)
+    hc_times = []
+    for minute in range(7):
+        clock.t = minute * 60.0
+        result = bot.iteration()
+        if "healthcheck" in result:
+            hc_times.append(minute * 60)
 
-    hc_count = sum(1 for r in results if "healthcheck" in r)
-    # After fix: only 1 healthcheck (the first one); before fix all 5 would
-    # trigger because _last_healthcheck was reset to None each iteration.
-    assert hc_count == 1, f"expected 1 healthcheck, got {hc_count} in {results}"
-    assert broker.account_calls == 1
+    assert hc_times == [0, 300], (
+        f"expected healthchecks at t=0 and t=300 only, got t={hc_times}")
+    assert broker.account_calls == 2
 
 
 def test_paused_healthcheck_failures_dont_grow_failures(daily_store, provider):
@@ -139,7 +137,6 @@ def test_paused_healthcheck_failures_dont_grow_failures(daily_store, provider):
         bot.iteration()
         clock.t += 60
 
-    # After fix: _failures should not have grown from healthcheck-only failures
     assert bot._failures == 0, f"expected 0 _failures, got {bot._failures}"
 
 
@@ -164,7 +161,7 @@ def test_next_delay_never_overflows(daily_store, provider):
     """``next_delay`` must never raise OverflowError, regardless of ``_failures``."""
     bot = TradingBot(daily_store, provider, MagicMock(), healthcheck_interval=0)
     bot._paused = False
-    bot._failures = 2_000_000  # extreme: months of continuous failure
+    bot._failures = 2_000_000
 
     delay = bot.next_delay(60)
     assert isinstance(delay, int)
@@ -211,44 +208,72 @@ def test_run_loop_recovers_from_delay_error(daily_store, provider, caplog):
 
     assert iteration_count[0] >= 3, "loop must survive OverflowError in next_delay"
     assert any("intervalo" in r.msg for r in caplog.records if r.levelname == "ERROR"), \
-        "should log the OverflowError"
+        "should log the delay-calc error"
 
 
 # ---- Iteration duration diagnostics -----------------------------------------
 
-def test_iteration_duration_metric(daily_store, provider):
-    """After each iteration, ``bot_iteration_duration_seconds`` must be set."""
+def test_iteration_duration_via_run(daily_store, provider):
+    """``bot_iteration_duration_seconds`` must reflect the actual wall-clock
+    duration measured by ``iteration()`` itself.  Verified through ``run()``
+    with a fake clock that advances 7 s **inside** the iteration's work phase
+    (``_iteration``), so the gauge reads a known value.
+    """
     from monitoring import exporter
 
+    clock = FakeClock(start=0.0)
     store = daily_store
-    bot = TradingBot(store, provider, MagicMock(), healthcheck_interval=0)
-    exporter.ITERATION_DURATION.set(0)
+    broker = MagicMock()
+    broker.name = "alpaca"
+    bot = TradingBot(store, provider, broker, healthcheck_interval=0, clock=clock)
+    exporter.ITERATION_DURATION.set(-1)
 
-    bot.iteration()
+    original = bot._iteration
+    calls = [0]
+
+    def slow_iteration(cfg):
+        clock.t += 7.0
+        result = original(cfg)
+        calls[0] += 1
+        if calls[0] >= 1:
+            bot.stop()
+        return result
+
+    bot._iteration = slow_iteration
+
+    bot.run()
+
     val = _metric("bot_iteration_duration_seconds")
-    assert val is not None and val >= 0
+    assert val is not None and val >= 7.0, (
+        f"expected duration >= 7.0 s from fake clock, got {val}")
+    assert bot._last_iteration_sec >= 7.0
 
 
 def test_slow_iteration_is_logged(daily_store, provider, caplog):
-    """Iterations exceeding the threshold are logged as warnings by ``run()``."""
-    clock = FakeClock()
+    """Iterations exceeding the threshold are logged as warnings by ``run()``,
+    reading the duration measured inside ``iteration()`` via fake clock.
+    The clock advances during ``_iteration`` so it falls within the timing
+    window of ``iteration()``.
+    """
+    clock = FakeClock(start=0.0)
     store = daily_store
     broker = MagicMock()
     broker.name = "alpaca"
     bot = TradingBot(store, provider, broker, healthcheck_interval=0, clock=clock)
 
-    original_iteration = bot.iteration
+    original = bot._iteration
 
-    def slow_then_stop():
-        clock.t += 150
-        result = original_iteration()
+    def slow_then_stop(cfg):
+        clock.t += 150.0
+        result = original(cfg)
         bot.stop()
         return result
 
-    bot.iteration = slow_then_stop
+    bot._iteration = slow_then_stop
 
     with caplog.at_level("WARNING", logger="bot"):
         bot.run()
 
-    assert any("iteración lenta" in r.msg for r in caplog.records), \
-        f"expected slow-iteration warning, got {[r.msg for r in caplog.records]}"
+    slow = [r for r in caplog.records if "iteración lenta" in r.msg]
+    assert slow, f"expected slow-iteration warning, got {[r.msg for r in caplog.records]}"
+    assert slow[0].elapsed_sec >= 150.0

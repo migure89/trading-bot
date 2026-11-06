@@ -77,6 +77,7 @@ class TradingBot:
         self._clock = clock
         self._last_healthcheck: float | None = None  # monotonic del último health-check en pausa
         self.running = True
+        self._last_iteration_sec: float = 0.0
         self.shutdown = shutdown or GracefulShutdown()
         self._paused: bool | None = None           # para registrar la pausa solo al cambiar
         self._failures = 0                          # fallos consecutivos del broker (backoff)
@@ -147,12 +148,11 @@ class TradingBot:
         return side
 
     def iteration(self) -> dict:
+        t0 = self._clock()
         cfg = self.store.load()  # hot-reload
         exporter.ITERATIONS.inc()
         exporter.LAST_ITERATION.set_to_current_time()
         exporter.update_config(cfg)          # bot_enabled / bot_live_mode / bot_info / bot_paused
-        # Primero se opera y después la sombra (solo señales; corre también en pausa): el escáner
-        # del universo dinámico no puede retrasar las órdenes del día.
         try:
             out = self._iteration(cfg)
         except ShutdownRequested:
@@ -163,6 +163,9 @@ class TradingBot:
         shadow = self.maybe_run_shadow(cfg)
         if shadow:
             out["shadow"] = shadow
+        elapsed = self._clock() - t0
+        self._last_iteration_sec = elapsed
+        exporter.ITERATION_DURATION.set(elapsed)
         return out
 
     def _finish_shadow(self, now: datetime) -> None:
@@ -347,22 +350,21 @@ class TradingBot:
         self.restore_shadow_metrics()
         try:
             while self.running and not self.shutdown.requested:
-                t0 = self._clock()
                 try:
                     self.iteration()
                 except Exception:
                     exporter.ERRORS.inc()
                     log.exception("error en iteración")
-                elapsed = self._clock() - t0
-                exporter.ITERATION_DURATION.set(elapsed)
-                if elapsed > 120:
-                    log.warning("iteración lenta", extra={"elapsed_sec": round(elapsed, 1)})
+                if self._last_iteration_sec > 120:
+                    log.warning("iteración lenta",
+                                extra={"elapsed_sec": round(self._last_iteration_sec, 1)})
                 try:
                     raw = int(self.store.get("loop_interval_sec", 60))
                     interval = self.next_delay(raw)
-                except Exception:
+                except Exception as exc:
                     interval = 60
-                    log.exception("error calculando el intervalo; se usa %ds", interval)
+                    log.error("error calculando el intervalo",
+                              extra={"error": str(exc) or type(exc).__name__, "fallback_sec": interval})
                 if self.shutdown.wait(interval):
                     break
         except ShutdownRequested as exc:
