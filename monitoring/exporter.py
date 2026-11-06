@@ -26,6 +26,8 @@ LAST_ITERATION = Gauge("bot_last_iteration_timestamp_seconds",
 LAST_HEALTHCHECK = Gauge("bot_last_healthcheck_timestamp_seconds",
                          "Momento (epoch) del último health-check correcto en pausa")
 PAUSED = Gauge("bot_paused", "1 si el bot está en pausa (kill switch)")
+ITERATION_DURATION = Gauge("bot_iteration_duration_seconds",
+                           "Duración de la última iteración del bucle principal")
 INFO = Gauge("bot_info", "Broker y modo configurados (valor siempre 1)", ["broker", "mode"])
 
 
