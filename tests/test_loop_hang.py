@@ -249,6 +249,65 @@ def test_iteration_duration_via_run(daily_store, provider):
     assert bot._last_iteration_sec >= 7.0
 
 
+def test_failed_iteration_still_records_duration(daily_store, provider, caplog):
+    """When ``_iteration()`` raises, ``iteration()`` must still record the
+    elapsed duration via ``try/finally``.  Otherwise ``run()`` reads a stale
+    ``_last_iteration_sec`` from a previous successful iteration and the
+    slow-iteration warning describes the wrong pass.
+
+    Scenario: iteration 1 succeeds in 1 s, iteration 2 takes 200 s and raises.
+    The gauge and warning must reflect the failed 200 s iteration, not the
+    successful 1 s one.
+    """
+    from monitoring import exporter
+
+    clock = FakeClock(start=0.0)
+    store = daily_store
+    broker = MagicMock()
+    broker.name = "alpaca"
+    bot = TradingBot(store, provider, broker, healthcheck_interval=0, clock=clock)
+    exporter.ITERATION_DURATION.set(-1)
+
+    original = bot._iteration
+    calls = [0]
+
+    def succeed_then_fail(cfg):
+        calls[0] += 1
+        if calls[0] == 1:
+            clock.t += 1.0
+            return original(cfg)
+        clock.t += 200.0
+        raise RuntimeError("simulated broker crash after slow work")
+
+    bot._iteration = succeed_then_fail
+
+    original_wait = bot.shutdown.wait
+    bot.shutdown.wait = lambda s: original_wait(min(s, 0.01))
+
+    # Stop after 3 iterations so the loop exits
+    iter_count = [0]
+    original_iter = bot.iteration
+
+    def counting_iteration():
+        iter_count[0] += 1
+        if iter_count[0] >= 3:
+            bot.stop()
+        return original_iter()
+
+    bot.iteration = counting_iteration
+
+    with caplog.at_level("WARNING", logger="bot"):
+        bot.run()
+
+    val = _metric("bot_iteration_duration_seconds")
+    assert val is not None and val >= 200.0, (
+        f"expected gauge >= 200.0 s from failed iteration, got {val}")
+    slow = [r for r in caplog.records if "iteración lenta" in r.msg]
+    assert any(getattr(r, "elapsed_sec", 0) >= 200.0 for r in slow), (
+        f"expected slow warning with elapsed_sec >= 200, got "
+        f"{[(r.msg, getattr(r, 'elapsed_sec', None)) for r in slow]}")
+
+
 def test_slow_iteration_is_logged(daily_store, provider, caplog):
     """Iterations exceeding the threshold are logged as warnings by ``run()``,
     reading the duration measured inside ``iteration()`` via fake clock.

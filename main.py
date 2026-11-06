@@ -149,24 +149,26 @@ class TradingBot:
 
     def iteration(self) -> dict:
         t0 = self._clock()
-        cfg = self.store.load()  # hot-reload
-        exporter.ITERATIONS.inc()
-        exporter.LAST_ITERATION.set_to_current_time()
-        exporter.update_config(cfg)          # bot_enabled / bot_live_mode / bot_info / bot_paused
         try:
-            out = self._iteration(cfg)
-        except ShutdownRequested:
-            raise
-        except Exception:
-            self.maybe_run_shadow(cfg)
-            raise
-        shadow = self.maybe_run_shadow(cfg)
-        if shadow:
-            out["shadow"] = shadow
-        elapsed = self._clock() - t0
-        self._last_iteration_sec = elapsed
-        exporter.ITERATION_DURATION.set(elapsed)
-        return out
+            cfg = self.store.load()  # hot-reload
+            exporter.ITERATIONS.inc()
+            exporter.LAST_ITERATION.set_to_current_time()
+            exporter.update_config(cfg)          # bot_enabled / bot_live_mode / bot_info / bot_paused
+            try:
+                out = self._iteration(cfg)
+            except ShutdownRequested:
+                raise
+            except Exception:
+                self.maybe_run_shadow(cfg)
+                raise
+            shadow = self.maybe_run_shadow(cfg)
+            if shadow:
+                out["shadow"] = shadow
+            return out
+        finally:
+            elapsed = self._clock() - t0
+            self._last_iteration_sec = elapsed
+            exporter.ITERATION_DURATION.set(elapsed)
 
     def _finish_shadow(self, now: datetime) -> None:
         self._shadow_retry_at, self._shadow_pending, self._shadow_attempts = None, None, 0
